@@ -1,9 +1,9 @@
 <x-app-layout>
 
-    <div class="app-page">
-        <div class="app-page-container">
+    <div class="app-page inventory-page w-100 m-0 p-0" style="max-width: none;">
+        <div class="app-page-container w-100 m-0 p-0" style="max-width: none;">
             
-    <div class="container mt-4">
+    <div class="container-fluid m-0 p-0">
 
 <!-- PAGE TITLE -->
         <div class="card app-card inventory-card">
@@ -64,6 +64,19 @@
                     'lost' => 'Lost',
                     'to_be_deleted' => 'To Be Deleted',
                 ];
+
+                // Toggle used to temporarily hide assets that already have a maintenance responsible.
+                $hideAssignedMaintenance = request()->boolean('hide_maintenance_assigned');
+                $maintenanceAssignmentToggleQuery = request()->query();
+
+                // Always return to page 1 because the result set changes when this filter is toggled.
+                unset($maintenanceAssignmentToggleQuery['page']);
+
+                if ($hideAssignedMaintenance) {
+                    unset($maintenanceAssignmentToggleQuery['hide_maintenance_assigned']);
+                } else {
+                    $maintenanceAssignmentToggleQuery['hide_maintenance_assigned'] = 1;
+                }
             @endphp
 
 <!-- BUTTONS ON TOP OF TABLE FOR ACTIONS -->
@@ -92,32 +105,52 @@
 
             <!-- Show Delete All Marked button if user has permission -->
             @if ($canDeleteInventory)
-
-                    <form
-                        id="deleteAllMarkedForm"
-                        action="{{ route('inventory.destroy-marked') }}"
-                        method="POST"
-                        class="d-inline"
-                        onsubmit="return confirm(
-                            'Are you sure you want to permanently delete all assets marked as To Be Deleted? This action cannot be undone.'
-                        );"
-                    >
+                <form
+                    id="deleteAllMarkedForm"
+                    action="{{ route('inventory.destroy-marked') }}"
+                    method="POST"
+                    class="d-inline"
+                    onsubmit="return confirm(
+                        'Are you sure you want to permanently delete all assets marked as To Be Deleted? This action cannot be undone.'
+                    );"
+                >
                     @csrf
                     @method('DELETE')
 
-                    <button
-                        type="submit"
-                        class="btn btn-sm btn-danger"
-                    >
+                    <button type="submit" class="btn btn-sm btn-danger">
                         Delete All Marked
                     </button>
                 </form>
-
             @endif
 
+            <!-- Export selected inventory assets -->
+            <form
+                id="exportSelectedAssetsForm"
+                method="POST"
+                action="{{ route('inventory.export-selected') }}"
+                class="d-inline"
+            >
+                @csrf
+
+                <input
+                    type="hidden"
+                    name="selected_asset_ids"
+                    id="exportSelectedAssetIds"
+                    value="[]"
+                >
+
+                <button
+                    type="submit"
+                    id="exportSelectedAssetsButton"
+                    class="btn btn-sm btn-outline-success"
+                    disabled
+                    title="Select one or more assets to export"
+                >
+                    Export Excel
+                </button>
+            </form>
 
             @if (Auth::user()->user_level === 'Admin')
-
                 <!-- Show Upload Excel button only for admins -->
                 <button
                     type="button"
@@ -127,9 +160,22 @@
                 >
                     Upload Excel
                 </button>
+            @endif
 
-            @endif    
-        @endif
+            @endif
+
+        <!-- Temporary maintenance assignment visibility filter for v1.8 -->
+        <a
+            href="{{ route('inventory', $maintenanceAssignmentToggleQuery) }}"
+            class="btn btn-sm {{ $hideAssignedMaintenance ? 'btn-warning' : 'btn-outline-warning' }}"
+            title="{{ $hideAssignedMaintenance
+                ? 'Show assets that already have a maintenance responsible'
+                : 'Hide assets that already have a maintenance responsible' }}"
+        >
+            {{ $hideAssignedMaintenance
+                ? 'Show already assigned to maintenance'
+                : 'Hide already assigned to maintenance' }}
+        </a>
 
         <a href="{{ route('inventory') }}" class="btn btn-sm btn-outline-danger">
             Reset filters
@@ -691,6 +737,9 @@
                                     <option value="pending" {{ request('maintenance_status') === 'pending' ? 'selected' : '' }}>
                                         Pending
                                     </option>
+                                    <option value="scheduled" {{ request('maintenance_status') === 'scheduled' ? 'selected' : '' }}>
+                                        Scheduled
+                                    </option>
                                     <option value="overdue" {{ request('maintenance_status') === 'overdue' ? 'selected' : '' }}>
                                         Overdue
                                     </option>
@@ -1063,8 +1112,10 @@
 
                                         $maintenanceBadgeClass = match ($maintenanceStatus) {
                                             'pending' => 'bg-warning text-dark',
+                                            'scheduled' => 'bg-secondary',
                                             'overdue' => 'bg-danger',
                                             'completed' => 'bg-success',
+                                            'awaiting' => 'bg-info text-dark',
                                             default => 'bg-secondary',
                                         };
                                     @endphp
@@ -1126,6 +1177,7 @@
                                         <div class="modal-content">
 
                                             <form
+                                                id="editAssetForm{{ $item->id }}"
                                                 method="POST"
                                                 action="{{ route('inventory.update', ['inventory' => $item->id] + request()->query()) }}"
                                                 class="inventory-edit-form"
@@ -1158,6 +1210,103 @@
 
                                                 <div class="modal-body inventory-modal-body">
 
+                                                <!-- Asset status -->
+                                                <section class="inventory-form-section">
+                                                    <div class="inventory-form-section-header">
+                                                        <h6>Asset Status</h6>
+                                                        <span>Current asset status and responsive document.</span>
+                                                    </div>
+
+                                                    <div class="row g-3 align-items-end">
+
+                                                        <!-- State -->
+                                                        <div class="col-md-6">
+                                                            <label class="form-label">State</label>
+
+                                                            <select name="state" class="form-select">
+                                                                <option
+                                                                    value="active"
+                                                                    {{ old('state', $item->state) === 'active' ? 'selected' : '' }}
+                                                                >
+                                                                    Active
+                                                                </option>
+
+                                                                <option
+                                                                    value="inactive"
+                                                                    {{ old('state', $item->state) === 'inactive' ? 'selected' : '' }}
+                                                                >
+                                                                    Inactive
+                                                                </option>
+
+                                                                <option
+                                                                    value="maintenance"
+                                                                    {{ old('state', $item->state) === 'maintenance' ? 'selected' : '' }}
+                                                                >
+                                                                    Maintenance
+                                                                </option>
+
+                                                                <option
+                                                                    value="degraded"
+                                                                    {{ old('state', $item->state) === 'degraded' ? 'selected' : '' }}
+                                                                >
+                                                                    Degraded
+                                                                </option>
+
+                                                                <option
+                                                                    value="damaged"
+                                                                    {{ old('state', $item->state) === 'damaged' ? 'selected' : '' }}
+                                                                >
+                                                                    Damaged
+                                                                </option>
+
+                                                                <option
+                                                                    value="disposed"
+                                                                    {{ old('state', $item->state) === 'disposed' ? 'selected' : '' }}
+                                                                >
+                                                                    Disposed
+                                                                </option>
+
+                                                                <option
+                                                                    value="lost"
+                                                                    {{ old('state', $item->state) === 'lost' ? 'selected' : '' }}
+                                                                >
+                                                                    Lost
+                                                                </option>
+
+                                                                <option
+                                                                    value="to_be_deleted"
+                                                                    {{ old('state', $item->state) === 'to_be_deleted' ? 'selected' : '' }}
+                                                                >
+                                                                    To Be Deleted
+                                                                </option>
+                                                            </select>
+                                                        </div>
+
+                                                        <!-- Responsive -->
+                                                        <div class="col-md-6">
+                                                            <div class="inventory-responsive-option">
+                                                                <div class="form-check inventory-responsive-check">
+                                                                    <input
+                                                                        class="form-check-input"
+                                                                        type="checkbox"
+                                                                        name="responsive"
+                                                                        id="responsive{{ $item->id }}"
+                                                                        value="1"
+                                                                        {{ old('responsive', $item->responsive) ? 'checked' : '' }}
+                                                                    >
+
+                                                                    <label
+                                                                        class="form-check-label fw-semibold"
+                                                                        for="responsive{{ $item->id }}"
+                                                                    >
+                                                                        Has responsive document
+                                                                    </label>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+
+                                                    </div>
+                                                </section>
                                                     <!-- Asset identification -->
                                                     <section class="inventory-form-section">
                                                         <div class="inventory-form-section-header">
@@ -1171,12 +1320,31 @@
                                                                     IT Internal Number
                                                                 </label>
 
-                                                                <input
-                                                                    type="text"
-                                                                    name="it_internal_number"
-                                                                    class="form-control"
-                                                                    value="{{ old('it_internal_number', $item->it_internal_number) }}"
-                                                                >
+                                                                <div class="input-group">
+                                                                    <input
+                                                                        type="text"
+                                                                        name="it_internal_number"
+                                                                        id="editAssetItInternalNumber{{ $item->id }}"
+                                                                        class="form-control"
+                                                                        value="{{ old('it_internal_number', $item->it_internal_number) }}"
+                                                                        autocomplete="off"
+                                                                    >
+
+                                                                    <button
+                                                                        type="button"
+                                                                        id="editAssetRegenerateInternalNumber{{ $item->id }}"
+                                                                        form="editAssetForm{{ $item->id }}"
+                                                                        class="btn btn-outline-primary inventory-regenerate-internal-number"
+                                                                        data-asset-id="{{ $item->id }}"
+                                                                    >
+                                                                        Re-generate
+                                                                    </button>
+                                                                </div>
+
+                                                                <div
+                                                                    id="editAssetItInternalNumberFeedback{{ $item->id }}"
+                                                                    class="invalid-feedback d-block"
+                                                                ></div>
                                                             </div>
 
                                                             <div class="col-md-4">
@@ -1230,7 +1398,7 @@
                                                             <div class="col-md-4">
                                                                 <label class="form-label">Category</label>
 
-                                                                <select name="category" class="form-select">
+                                                                <select name="category" id="editAssetCategory{{ $item->id }}" class="form-select">
                                                                     <option value="">Select category</option>
 
                                                                     @foreach ($categoryOptions as $category)
@@ -1280,7 +1448,7 @@
                                                         </div>
 
                                                         @php
-                                                            $validPlantOptions = ['B', 'D', 'G', 'H', 'MP'];
+                                                            $validPlantOptions = ['B', 'D', 'G', 'H', 'MP', 'MPI', 'MPII'];
                                                             $currentPlant = old('plant', $item->plant);
                                                             $isCurrentItRoom = strtoupper(trim(old('location', $item->location) ?? '')) === 'IT ROOM';
                                                         @endphp
@@ -1336,13 +1504,34 @@
                                                             <div class="col-md-4">
                                                                 <label class="form-label">Department</label>
 
-                                                                <input
-                                                                    type="text"
+                                                                @php
+                                                                    $currentDepartment = old('department', $item->department);
+                                                                @endphp
+
+                                                                <select
                                                                     name="department"
-                                                                    class="form-control"
-                                                                    value="{{ old('department', $item->department) }}"
+                                                                    id="editAssetDepartment{{ $item->id }}"
+                                                                    class="form-select"
                                                                     data-it-room-field="department"
                                                                 >
+                                                                    <option value="">Select department</option>
+
+                                                                    {{-- Preserve historical departments that are not yet in the temporary mapping --}}
+                                                                    @if ($currentDepartment && !in_array($currentDepartment, $departmentOptions, true))
+                                                                        <option value="{{ $currentDepartment }}" selected>
+                                                                            Legacy value: {{ $currentDepartment }}
+                                                                        </option>
+                                                                    @endif
+
+                                                                    @foreach ($departmentOptions as $department)
+                                                                        <option
+                                                                            value="{{ $department }}"
+                                                                            {{ $currentDepartment === $department ? 'selected' : '' }}
+                                                                        >
+                                                                            {{ $department }}
+                                                                        </option>
+                                                                    @endforeach
+                                                                </select>
                                                             </div>
 
                                                             <div class="col-md-4">
@@ -1374,6 +1563,7 @@
 
                                                                 <select
                                                                     name="plant"
+                                                                    id="editAssetPlant{{ $item->id }}"
                                                                     class="form-select inventory-it-room-plant"
                                                                 >
                                                                     <option value="">Select plant</option>
@@ -1475,7 +1665,6 @@
 
                                                         <div class="row g-3">
 
-                                                            <!-- Next Maintenance -->
                                                             <div class="col-md-4">
                                                                 <label class="form-label">
                                                                     Next Maintenance
@@ -1485,13 +1674,14 @@
                                                                     type="date"
                                                                     name="next_maintenance"
                                                                     class="form-control"
-                                                                    value="{{ old('next_maintenance') }}"
+                                                                    value="{{ old(
+                                                                        'next_maintenance',
+                                                                        optional($item->next_maintenance)->format('Y-m-d')
+                                                                    ) }}"
                                                                     {{ !$canManageMaintenance ? 'disabled' : '' }}
                                                                 >
                                                             </div>
 
-
-                                                            <!-- Maintenance Responsible -->
                                                             <div class="col-md-4">
                                                                 <label class="form-label">
                                                                     Maintenance Responsible
@@ -1508,22 +1698,27 @@
                                                                         </option>
 
                                                                         @foreach ($maintenanceResponsibleOptions as $responsible)
+
                                                                             <option
                                                                                 value="{{ $responsible->id }}"
                                                                                 {{
-                                                                                    (string) old('maintenance_responsible_id')
-                                                                                    === (string) $responsible->id
+                                                                                    (string) old(
+                                                                                        'maintenance_responsible_id',
+                                                                                        $item->maintenance_responsible_id
+                                                                                    ) === (string) $responsible->id
                                                                                         ? 'selected'
                                                                                         : ''
                                                                                 }}
                                                                             >
                                                                                 {{ $responsible->name }}
 
-                                                                                @if (!empty($responsible->employee_number))
+                                                                                @if ($responsible->employee_number)
                                                                                     — {{ $responsible->employee_number }}
                                                                                 @endif
                                                                             </option>
+
                                                                         @endforeach
+
                                                                     </select>
 
                                                                 @else
@@ -1531,15 +1726,13 @@
                                                                     <input
                                                                         type="text"
                                                                         class="form-control"
-                                                                        value="Not assigned"
+                                                                        value="{{ $item->maintenanceResponsible?->name ?? 'Not assigned' }}"
                                                                         disabled
                                                                     >
 
                                                                 @endif
                                                             </div>
 
-
-                                                            <!-- Maintenance Status -->
                                                             <div class="col-md-4">
                                                                 <label class="form-label">
                                                                     Maintenance Status
@@ -1548,33 +1741,23 @@
                                                                 <input
                                                                     type="text"
                                                                     class="form-control"
-                                                                    value="Pending"
+                                                                    value="{{ ucfirst($item->effective_maintenance_status ?? 'pending') }}"
                                                                     disabled
                                                                 >
-
-                                                                <small class="form-text text-muted">
-                                                                    New assets start with pending maintenance status.
-                                                                </small>
                                                             </div>
 
                                                         </div>
-
-                                                        @if (!$canManageMaintenance)
-                                                            <small class="form-text text-muted d-block mt-3">
-                                                                The Maintenance Management badge is required to modify this section.
-                                                            </small>
-                                                        @endif
                                                     </section>
 
                                                     <!-- Status and classification -->
                                                     <section class="inventory-form-section">
                                                         <div class="inventory-form-section-header">
-                                                            <h6>Status and Classification</h6>
-                                                            <span>Asset status, classification and CIA security values.</span>
+                                                        <h6>Classification</h6>
+                                                        <span>Security classification and CIA values.</span>
                                                         </div>
 
                                                         <div class="row g-3">
-                                                            <div class="col-md-6">
+                                                            <div class="col-md-12">
                                                                 <label class="form-label">Classification</label>
 
                                                                 <input
@@ -1587,69 +1770,6 @@
                                                                 <small class="form-text text-muted">
                                                                     Classification is automatically assigned based on Confidentiality, Integrity and Availability.
                                                                 </small>
-                                                            </div>
-
-                                                            <div class="col-md-6">
-                                                                <label class="form-label">State</label>
-
-                                                                <select name="state" class="form-select">
-                                                                    <option
-                                                                        value="active"
-                                                                        {{ old('state', $item->state) === 'active' ? 'selected' : '' }}
-                                                                    >
-                                                                        Active
-                                                                    </option>
-
-                                                                    <option
-                                                                        value="inactive"
-                                                                        {{ old('state', $item->state) === 'inactive' ? 'selected' : '' }}
-                                                                    >
-                                                                        Inactive
-                                                                    </option>
-
-                                                                    <option
-                                                                        value="maintenance"
-                                                                        {{ old('state', $item->state) === 'maintenance' ? 'selected' : '' }}
-                                                                    >
-                                                                        Maintenance
-                                                                    </option>
-
-                                                                    <option
-                                                                        value="degraded"
-                                                                        {{ old('state', $item->state) === 'degraded' ? 'selected' : '' }}
-                                                                    >
-                                                                        Degraded
-                                                                    </option>
-
-                                                                    <option
-                                                                        value="damaged"
-                                                                        {{ old('state', $item->state) === 'damaged' ? 'selected' : '' }}
-                                                                    >
-                                                                        Damaged
-                                                                    </option>
-
-                                                                    <option
-                                                                        value="disposed"
-                                                                        {{ old('state', $item->state) === 'disposed' ? 'selected' : '' }}
-                                                                    >
-                                                                        Disposed
-                                                                    </option>
-
-                                                                    <option
-                                                                        value="lost"
-                                                                        {{ old('state', $item->state) === 'lost' ? 'selected' : '' }}
-                                                                    >
-                                                                        Lost
-                                                                    </option>
-
-                                                                    {{-- This state can only be assigned while editing --}}
-                                                                    <option
-                                                                        value="to_be_deleted"
-                                                                        {{ old('state', $item->state) === 'to_be_deleted' ? 'selected' : '' }}
-                                                                    >
-                                                                        To Be Deleted
-                                                                    </option>
-                                                                </select>
                                                             </div>
 
                                                             <div class="col-md-4">
@@ -1731,26 +1851,6 @@
                                                                     rows="3"
                                                                 >{{ old('comments', $item->comments) }}</textarea>
                                                             </div>
-
-                                                            <div class="col-12">
-                                                                <div class="form-check inventory-responsive-check">
-                                                                    <input
-                                                                        class="form-check-input"
-                                                                        type="checkbox"
-                                                                        name="responsive"
-                                                                        id="responsive{{ $item->id }}"
-                                                                        value="1"
-                                                                        {{ old('responsive', $item->responsive) ? 'checked' : '' }}
-                                                                    >
-
-                                                                    <label
-                                                                        class="form-check-label"
-                                                                        for="responsive{{ $item->id }}"
-                                                                    >
-                                                                        Has responsive document
-                                                                    </label>
-                                                                </div>
-                                                            </div>
                                                         </div>
                                                     </section>
 
@@ -1763,6 +1863,14 @@
                                                         data-bs-dismiss="modal"
                                                     >
                                                         Cancel
+                                                    </button>
+
+                                                    <button
+                                                        type="reset"
+                                                        form="editAssetForm{{ $item->id }}"
+                                                        class="btn btn-outline-danger inventory-reset-original-values"
+                                                    >
+                                                        Reset to previous values
                                                     </button>
 
                                                     <button type="submit" class="btn btn-primary">
@@ -1882,6 +1990,75 @@
                                 </div>
                             @endif
 
+                            <!-- Asset status -->
+                            <section class="inventory-form-section">
+                                <div class="inventory-form-section-header">
+                                    <h6>Asset Status</h6>
+                                    <span>Initial asset status and responsive document.</span>
+                                </div>
+
+                                <div class="row g-3 align-items-end">
+
+                                    <!-- State -->
+                                    <div class="col-md-6">
+                                        <label class="form-label">State</label>
+
+                                        <select name="state" class="form-select">
+                                            <option value="active" {{ old('state', 'active') === 'active' ? 'selected' : '' }}>
+                                                Active
+                                            </option>
+
+                                            <option value="inactive" {{ old('state') === 'inactive' ? 'selected' : '' }}>
+                                                Inactive
+                                            </option>
+
+                                            <option value="maintenance" {{ old('state') === 'maintenance' ? 'selected' : '' }}>
+                                                Maintenance
+                                            </option>
+
+                                            <option value="degraded" {{ old('state') === 'degraded' ? 'selected' : '' }}>
+                                                Degraded
+                                            </option>
+
+                                            <option value="damaged" {{ old('state') === 'damaged' ? 'selected' : '' }}>
+                                                Damaged
+                                            </option>
+
+                                            <option value="disposed" {{ old('state') === 'disposed' ? 'selected' : '' }}>
+                                                Disposed
+                                            </option>
+
+                                            <option value="lost" {{ old('state') === 'lost' ? 'selected' : '' }}>
+                                                Lost
+                                            </option>
+                                        </select>
+                                    </div>
+
+                                    <!-- Responsive -->
+                                    <div class="col-md-6">
+                                        <div class="inventory-responsive-option">
+                                            <div class="form-check inventory-responsive-check">
+                                                <input
+                                                    class="form-check-input"
+                                                    type="checkbox"
+                                                    name="responsive"
+                                                    id="addAssetResponsive"
+                                                    value="1"
+                                                    {{ old('responsive') ? 'checked' : '' }}
+                                                >
+
+                                                <label
+                                                    class="form-check-label fw-semibold"
+                                                    for="addAssetResponsive"
+                                                >
+                                                    Has responsive document
+                                                </label>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                </div>
+                            </section>
                             <!-- Identification -->
                             <section class="inventory-form-section">
                                 <div class="inventory-form-section-header">
@@ -1892,12 +2069,37 @@
                                 <div class="row g-3">
                                     <div class="col-md-4">
                                         <label class="form-label">IT Internal Number</label>
+
+                                        <div class="input-group">
+                                            <input
+                                                type="text"
+                                                name="it_internal_number"
+                                                id="addAssetItInternalNumber"
+                                                class="form-control bg-light"
+                                                value="{{ old('it_internal_number') }}"
+                                                placeholder="Generated based on asset data"
+                                                readonly
+                                            >
+
+                                            <button
+                                                type="button"
+                                                id="addAssetManualInternalNumberButton"
+                                                class="btn btn-outline-secondary"
+                                            >
+                                                Manual insertion
+                                            </button>
+                                        </div>
+
                                         <input
-                                            type="text"
-                                            name="it_internal_number"
-                                            class="form-control"
-                                            value="{{ old('it_internal_number') }}"
+                                            type="hidden"
+                                            name="it_internal_number_mode"
+                                            id="addAssetInternalNumberMode"
+                                            value="{{ old('it_internal_number_mode', 'auto') }}"
                                         >
+
+                                        <small id="addAssetInternalNumberHelp" class="form-text text-muted">
+                                            Generated automatically from Category, Plant and Department.
+                                        </small>
                                     </div>
 
                                     <div class="col-md-4">
@@ -1941,8 +2143,13 @@
                                     </div>
 
                                     <div class="col-md-4">
-                                        <label class="form-label">Category</label>
-                                        <select name="category" class="form-select">
+                                        <label class="form-label">Category <span class="text-danger">*</span></label>
+                                        <select
+                                            name="category"
+                                            id="addAssetCategory"
+                                            class="form-select"
+                                            required
+                                        >
                                             <option value="">Select category</option>
 
                                             @foreach ($categoryOptions as $category)
@@ -2033,14 +2240,25 @@
                                     </div>
 
                                     <div class="col-md-4">
-                                        <label class="form-label">Department</label>
-                                        <input
-                                            type="text"
+                                        <label class="form-label">Department <span class="text-danger">*</span></label>
+                                        <select
                                             name="department"
-                                            class="form-control"
-                                            value="{{ old('department') }}"
+                                            id="addAssetDepartment"
+                                            class="form-select"
+                                            required
                                             data-it-room-field="department"
                                         >
+                                            <option value="">Select department</option>
+
+                                            @foreach ($departmentOptions as $department)
+                                                <option
+                                                    value="{{ $department }}"
+                                                    {{ old('department') === $department ? 'selected' : '' }}
+                                                >
+                                                    {{ $department }}
+                                                </option>
+                                            @endforeach
+                                        </select>
                                     </div>
 
                                     <div class="col-md-4">
@@ -2066,15 +2284,16 @@
                                     </div>
 
                                     <div class="col-md-4">
-                                        <label class="form-label">Plant</label>
+                                        <label class="form-label">Plant <span class="text-danger">*</span></label>
                                         <select
                                             name="plant"
                                             class="form-select inventory-it-room-plant"
                                             id="addAssetPlant"
+                                            required
                                         >
                                             <option value="">Select plant</option>
 
-                                            @foreach (['B', 'D', 'G', 'H', 'MP'] as $plant)
+                                            @foreach (['B', 'D', 'G', 'H', 'MP', 'MPI', 'MPII'] as $plant)
                                                 <option
                                                     value="{{ $plant }}"
                                                     {{ old('plant') === $plant ? 'selected' : '' }}
@@ -2237,15 +2456,15 @@
                                 @endif
                             </section>
 
-                            <!-- Status and classification -->
+                            <!-- Classification -->
                             <section class="inventory-form-section">
                                 <div class="inventory-form-section-header">
-                                    <h6>Status and Classification</h6>
-                                    <span>Asset status, classification and CIA security values.</span>
+                                <h6>Classification</h6>
+                                <span>Security classification and CIA values.</span>
                                 </div>
 
                                 <div class="row g-3">
-                                    <div class="col-md-6">
+                                    <div class="col-md-12">
                                         <label class="form-label">Classification</label>
 
                                         <input
@@ -2258,40 +2477,6 @@
                                         <small class="form-text text-muted">
                                             Classification is automatically assigned based on Confidentiality, Integrity and Availability.
                                         </small>
-                                    </div>
-
-                                    <div class="col-md-6">
-                                        <label class="form-label">State</label>
-
-                                        <select name="state" class="form-select">
-                                            <option value="active" {{ old('state', 'active') === 'active' ? 'selected' : '' }}>
-                                                Active
-                                            </option>
-
-                                            <option value="inactive" {{ old('state') === 'inactive' ? 'selected' : '' }}>
-                                                Inactive
-                                            </option>
-
-                                            <option value="maintenance" {{ old('state') === 'maintenance' ? 'selected' : '' }}>
-                                                Maintenance
-                                            </option>
-
-                                            <option value="degraded" {{ old('state') === 'degraded' ? 'selected' : '' }}>
-                                                Degraded
-                                            </option>
-
-                                            <option value="damaged" {{ old('state') === 'damaged' ? 'selected' : '' }}>
-                                                Damaged
-                                            </option>
-
-                                            <option value="disposed" {{ old('state') === 'disposed' ? 'selected' : '' }}>
-                                                Disposed
-                                            </option>
-
-                                            <option value="lost" {{ old('state') === 'lost' ? 'selected' : '' }}>
-                                                Lost
-                                            </option>
-                                        </select>
                                     </div>
 
                                     <div class="col-md-4">
@@ -2336,7 +2521,6 @@
                             <section class="inventory-form-section mb-0">
                                 <div class="inventory-form-section-header">
                                     <h6>Additional Information</h6>
-                                    <span>Comments and responsive document information.</span>
                                 </div>
 
                                 <div class="row g-3">
@@ -2347,26 +2531,6 @@
                                             class="form-control"
                                             rows="3"
                                         >{{ old('comments') }}</textarea>
-                                    </div>
-
-                                    <div class="col-12">
-                                        <div class="form-check inventory-responsive-check">
-                                            <input
-                                                class="form-check-input"
-                                                type="checkbox"
-                                                name="responsive"
-                                                id="addAssetResponsive"
-                                                value="1"
-                                                {{ old('responsive') ? 'checked' : '' }}
-                                            >
-
-                                            <label
-                                                class="form-check-label"
-                                                for="addAssetResponsive"
-                                            >
-                                                Has responsive document
-                                            </label>
-                                        </div>
                                     </div>
                                 </div>
                             </section>
@@ -2467,6 +2631,54 @@
     </script>
     <!-- End of Auto-submit filter form on change -->
 
+
+    <!-- Inventory single-scroll viewport layout -->
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const inventoryPage = document.querySelector('.inventory-page');
+            const inventoryCard = document.querySelector('.inventory-card');
+
+            if (!inventoryPage || !inventoryCard) {
+                return;
+            }
+
+            /*
+             * The inventory uses its own internal table scroll.
+             * Prevent the document itself from becoming a second scroll area.
+             */
+            document.body.classList.add('inventory-page-active');
+
+            function updateInventoryViewportHeight() {
+                /*
+                 * Measure the card's real position below the navbar and assign
+                 * exactly the remaining viewport height to the inventory card.
+                 * The card header and footer keep their natural height, while
+                 * the table body automatically receives the remaining space.
+                 */
+                const viewportHeight = window.visualViewport
+                    ? window.visualViewport.height
+                    : window.innerHeight;
+
+                const cardTop = inventoryCard.getBoundingClientRect().top;
+                const availableHeight = Math.max(360, viewportHeight - cardTop);
+
+                inventoryCard.style.height = availableHeight + 'px';
+            }
+
+            updateInventoryViewportHeight();
+
+            window.addEventListener('resize', updateInventoryViewportHeight);
+
+            if (window.visualViewport) {
+                window.visualViewport.addEventListener(
+                    'resize',
+                    updateInventoryViewportHeight
+                );
+            }
+        });
+    </script>
+    <!-- End inventory single-scroll viewport layout -->
+
     <!-- Page jump handler -->
     <script>
         document.addEventListener('DOMContentLoaded', function () {
@@ -2493,6 +2705,450 @@
         });
     </script>
     <!-- End of page jump handler -->
+
+    <!-- v1.8.2 Create Asset automatic IT Internal Number preview -->
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+
+        const form = document.getElementById('addAssetForm');
+        const internalNumberInput = document.getElementById('addAssetItInternalNumber');
+        const manualButton = document.getElementById('addAssetManualInternalNumberButton');
+        const modeInput = document.getElementById('addAssetInternalNumberMode');
+        const helpText = document.getElementById('addAssetInternalNumberHelp');
+        const categorySelect = document.getElementById('addAssetCategory');
+        const plantSelect = document.getElementById('addAssetPlant');
+        const departmentSelect = document.getElementById('addAssetDepartment');
+
+        if (
+            !form || !internalNumberInput || !manualButton || !modeInput ||
+            !categorySelect || !plantSelect || !departmentSelect
+        ) {
+            return;
+        }
+
+        const categoryAcronyms = @json($categoryAcronymMap ?? []);
+        const plantCodes = @json($plantCodeMap ?? []);
+        const departmentAcronyms = @json($departmentAcronymMap ?? []);
+        const nextSequentialByCategory = @json($nextSequentialByCategory ?? []);
+        const currentYear = @json($autoInternalNumberYear ?? now()->year);
+
+        function formatSequence(value) {
+            return String(value).padStart(3, '0');
+        }
+
+        function updatePreview() {
+            if (modeInput.value !== 'auto') {
+                return;
+            }
+
+            const category = categorySelect.value;
+            const plant = plantSelect.value;
+            const department = departmentSelect.value;
+
+            const categoryCode = categoryAcronyms[category] || '';
+            const plantCode = plantCodes[plant] || '';
+            const departmentCode = departmentAcronyms[department] || '';
+            const nextSequential = nextSequentialByCategory[category] || null;
+
+            if (!categoryCode || !plantCode || !departmentCode || !nextSequential) {
+                internalNumberInput.value = '';
+                internalNumberInput.placeholder = 'Generated based on asset data';
+
+                helpText.textContent = category && !categoryCode
+                    ? 'This category does not have a temporary automatic acronym yet. Use Manual insertion or select a mapped category.'
+                    : 'Select Category, Plant and Department to generate the preview.';
+
+                return;
+            }
+
+            internalNumberInput.value = [
+                categoryCode,
+                plantCode,
+                departmentCode,
+                formatSequence(nextSequential),
+                currentYear
+            ].join('-');
+
+            helpText.textContent =
+                'Preview only. The sequential number is verified again when the asset is saved.';
+        }
+
+        function setAutomaticMode(enabled) {
+            modeInput.value = enabled ? 'auto' : 'manual';
+            internalNumberInput.readOnly = enabled;
+            internalNumberInput.classList.toggle('bg-light', enabled);
+
+            if (enabled) {
+                manualButton.textContent = 'Manual insertion';
+                manualButton.classList.remove('btn-outline-primary');
+                manualButton.classList.add('btn-outline-secondary');
+                updatePreview();
+            } else {
+                manualButton.textContent = 'Use automatic generation';
+                manualButton.classList.remove('btn-outline-secondary');
+                manualButton.classList.add('btn-outline-primary');
+                helpText.textContent =
+                    'Manual mode enabled. The entered IT Internal Number will be preserved.';
+                internalNumberInput.focus();
+            }
+        }
+
+        manualButton.addEventListener('click', function () {
+            setAutomaticMode(modeInput.value === 'manual');
+        });
+
+        categorySelect.addEventListener('change', updatePreview);
+        plantSelect.addEventListener('change', updatePreview);
+        departmentSelect.addEventListener('change', updatePreview);
+
+        const itRoomToggle = form.querySelector('.inventory-it-room-toggle');
+
+        if (itRoomToggle) {
+            itRoomToggle.addEventListener('change', function () {
+                window.setTimeout(updatePreview, 0);
+            });
+        }
+
+        setAutomaticMode(modeInput.value !== 'manual');
+    });
+    </script>
+    <!-- End v1.8.2 Create Asset automatic IT Internal Number preview -->
+
+    <!-- v1.8.2 Edit Asset IT Internal Number assistance -->
+    <script>
+    document.addEventListener('DOMContentLoaded', function () {
+
+        const categoryAcronyms = @json($categoryAcronymMap ?? []);
+        const plantCodes = @json($plantCodeMap ?? []);
+        const departmentAcronyms = @json($departmentAcronymMap ?? []);
+        const nextSequentialByCategory = @json($nextSequentialByCategory ?? []);
+        const existingInternalNumberRecords = @json($existingInternalNumberRecords ?? []);
+
+        function formatSequence(value) {
+            return String(value).padStart(3, '0');
+        }
+
+        function parseInternalNumber(value) {
+            const match = String(value || '').trim().match(
+                /^(.+?)-([^-]+)-([^-]+)-(\d+)-(\d{4})$/
+            );
+
+            if (!match) {
+                return null;
+            }
+
+            return {
+                categoryCode: match[1],
+                plantCode: match[2],
+                departmentCode: match[3],
+                sequential: match[4],
+                year: match[5]
+            };
+        }
+
+        function setInternalNumberMessage(input, feedback, message) {
+            if (!input || !feedback) {
+                return;
+            }
+
+            if (message) {
+                input.classList.add('is-invalid');
+                feedback.textContent = message;
+            } else {
+                input.classList.remove('is-invalid');
+                feedback.textContent = '';
+            }
+        }
+
+        function findDuplicate(number, currentAssetId) {
+            const normalizedNumber = String(number || '').trim();
+
+            if (!normalizedNumber) {
+                return null;
+            }
+
+            return existingInternalNumberRecords.find(function (record) {
+                return String(record.number).trim() === normalizedNumber &&
+                    String(record.id) !== String(currentAssetId);
+            }) || null;
+        }
+
+        function validateInternalNumber(input, feedback, assetId) {
+            const value = input.value.trim();
+
+            if (!value) {
+                setInternalNumberMessage(input, feedback, '');
+                return true;
+            }
+
+            const duplicate = findDuplicate(value, assetId);
+
+            if (duplicate) {
+                setInternalNumberMessage(
+                    input,
+                    feedback,
+                    'This IT Internal Number already exists in the inventory. Review the asset data or manually change the sequential number before saving.'
+                );
+                return false;
+            }
+
+            setInternalNumberMessage(input, feedback, '');
+            return true;
+        }
+
+        function replaceSafeCode(input, feedback, assetId, type, newCode) {
+            if (!newCode) {
+                return;
+            }
+
+            const parsed = parseInternalNumber(input.value);
+
+            if (!parsed) {
+                setInternalNumberMessage(
+                    input,
+                    feedback,
+                    'The current IT Internal Number does not match the expected structure, so it could not be updated automatically. You can correct it manually or use Re-generate internal number.'
+                );
+                return;
+            }
+
+            if (type === 'plant') {
+                parsed.plantCode = newCode;
+            }
+
+            if (type === 'department') {
+                parsed.departmentCode = newCode;
+            }
+
+            input.value = [
+                parsed.categoryCode,
+                parsed.plantCode,
+                parsed.departmentCode,
+                parsed.sequential,
+                parsed.year
+            ].join('-');
+
+            validateInternalNumber(input, feedback, assetId);
+        }
+
+        document.querySelectorAll('.inventory-edit-form').forEach(function (form) {
+
+            const assetId = form.dataset.assetId;
+            const internalNumberInput = document.getElementById(
+                `editAssetItInternalNumber${assetId}`
+            );
+            const feedback = document.getElementById(
+                `editAssetItInternalNumberFeedback${assetId}`
+            );
+            const categorySelect = document.getElementById(
+                `editAssetCategory${assetId}`
+            );
+            const plantSelect = document.getElementById(
+                `editAssetPlant${assetId}`
+            );
+            const departmentInput = document.getElementById(
+                `editAssetDepartment${assetId}`
+            );
+            const regenerateButton = document.getElementById(
+                `editAssetRegenerateInternalNumber${assetId}`
+            );
+
+            if (
+                !internalNumberInput ||
+                !feedback ||
+                !categorySelect ||
+                !plantSelect ||
+                !departmentInput ||
+                !regenerateButton
+            ) {
+                return;
+            }
+
+            /*
+            |------------------------------------------------------------------
+            | Manual IT Internal Number control
+            |------------------------------------------------------------------
+            |
+            | The field is always editable. Manual typing never enables a
+            | persistent automatic mode; it only triggers duplicate review.
+            |
+            */
+            internalNumberInput.addEventListener('input', function () {
+                validateInternalNumber(
+                    internalNumberInput,
+                    feedback,
+                    assetId
+                );
+            });
+
+            /*
+            |------------------------------------------------------------------
+            | Plant changes are safe structural changes
+            |------------------------------------------------------------------
+            */
+            plantSelect.addEventListener('change', function () {
+                const plantCode = plantCodes[plantSelect.value] || '';
+
+                replaceSafeCode(
+                    internalNumberInput,
+                    feedback,
+                    assetId,
+                    'plant',
+                    plantCode
+                );
+            });
+
+            /*
+            |------------------------------------------------------------------
+            | Department changes are safe structural changes
+            |------------------------------------------------------------------
+            |
+            | Department is selected from the temporary controlled list.
+            | Selecting a mapped department updates only the Department segment
+            | of the current IT Internal Number.
+            |
+            */
+            departmentInput.addEventListener('change', function () {
+                const departmentCode =
+                    departmentAcronyms[departmentInput.value.trim()] || '';
+
+                if (!departmentCode) {
+                    return;
+                }
+
+                replaceSafeCode(
+                    internalNumberInput,
+                    feedback,
+                    assetId,
+                    'department',
+                    departmentCode
+                );
+            });
+
+            /*
+            |------------------------------------------------------------------
+            | Category requires explicit re-generation
+            |------------------------------------------------------------------
+            |
+            | A Category change affects both acronym and sequential number.
+            | Re-generation writes one new value and immediately returns full
+            | manual control to the user.
+            |
+            */
+            regenerateButton.addEventListener('click', function () {
+
+                const category = categorySelect.value;
+                const plant = plantSelect.value;
+                const department = departmentInput.value.trim();
+
+                const categoryCode = categoryAcronyms[category] || '';
+                const plantCode = plantCodes[plant] || '';
+                const departmentCode = departmentAcronyms[department] || '';
+                const nextSequential = nextSequentialByCategory[category] || null;
+
+                if (!categoryCode) {
+                    window.alert(
+                        'The selected Category does not have an automatic acronym configured yet.'
+                    );
+                    return;
+                }
+
+                if (!plantCode) {
+                    window.alert(
+                        'The selected Plant does not have an automatic MX code configured yet.'
+                    );
+                    return;
+                }
+
+                if (!departmentCode) {
+                    window.alert(
+                        'The current Department does not have an automatic acronym configured yet.'
+                    );
+                    return;
+                }
+
+                if (!nextSequential) {
+                    window.alert(
+                        'A sequential number could not be calculated for the selected Category.'
+                    );
+                    return;
+                }
+
+                const parsedCurrentNumber = parseInternalNumber(
+                    internalNumberInput.value
+                );
+
+                if (!parsedCurrentNumber) {
+                    window.alert(
+                        'The current IT Internal Number does not contain a valid year. Correct it manually before using re-generation.'
+                    );
+                    return;
+                }
+
+                internalNumberInput.value = [
+                    categoryCode,
+                    plantCode,
+                    departmentCode,
+                    formatSequence(nextSequential),
+                    parsedCurrentNumber.year
+                ].join('-');
+
+                validateInternalNumber(
+                    internalNumberInput,
+                    feedback,
+                    assetId
+                );
+
+                internalNumberInput.focus();
+            });
+
+            /*
+            | IT Room may update Department after its own checkbox handler.
+            | Wait until that handler finishes, then synchronize the safe codes.
+            */
+            const itRoomToggle = document.getElementById(
+                `editAssetItRoom${assetId}`
+            );
+
+            if (itRoomToggle) {
+                itRoomToggle.addEventListener('change', function () {
+                    window.setTimeout(function () {
+                        const plantCode = plantCodes[plantSelect.value] || '';
+                        const departmentCode =
+                            departmentAcronyms[departmentInput.value.trim()] || '';
+
+                        if (plantCode) {
+                            replaceSafeCode(
+                                internalNumberInput,
+                                feedback,
+                                assetId,
+                                'plant',
+                                plantCode
+                            );
+                        }
+
+                        if (departmentCode) {
+                            replaceSafeCode(
+                                internalNumberInput,
+                                feedback,
+                                assetId,
+                                'department',
+                                departmentCode
+                            );
+                        }
+                    }, 0);
+                });
+            }
+
+            validateInternalNumber(
+                internalNumberInput,
+                feedback,
+                assetId
+            );
+        });
+    });
+    </script>
+    <!-- End v1.8.2 Edit Asset IT Internal Number assistance -->
 
     <!-- Error Handling for Add Asset Modal -->
      @if ($errors->any())
@@ -2704,6 +3360,14 @@
             'clearSelectedAssets'
         );
 
+        const exportSelectedButton = document.getElementById(
+            'exportSelectedAssetsButton'
+        );
+
+        const exportSelectedInput = document.getElementById(
+            'exportSelectedAssetIds'
+        );
+
 
         /*
         |--------------------------------------------------------------------------
@@ -2765,17 +3429,51 @@
         */
         function updateSelectionCounter() {
 
-            if (!selectionCounter) {
-                return;
-            }
-
             const selectedAssets = getSelectedAssets();
             const totalSelected = selectedAssets.length;
 
-            selectionCounter.textContent =
-                totalSelected === 1
-                    ? '1 selected'
-                    : `${totalSelected} selected`;
+            /*
+            |--------------------------------------------------------------------------
+            | Update selection counter
+            |--------------------------------------------------------------------------
+            */
+
+            if (selectionCounter) {
+
+                selectionCounter.textContent =
+                    totalSelected === 1
+                        ? '1 selected'
+                        : `${totalSelected} selected`;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | Update Excel export button
+            |--------------------------------------------------------------------------
+            */
+
+            if (exportSelectedButton) {
+
+                const hasSelection = totalSelected > 0;
+
+                exportSelectedButton.disabled = !hasSelection;
+
+                exportSelectedButton.title = hasSelection
+                    ? `Export ${totalSelected} selected asset(s) to Excel`
+                    : 'Select one or more assets to export';
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | Keep selected asset IDs ready for export
+            |--------------------------------------------------------------------------
+            */
+
+            if (exportSelectedInput) {
+
+                exportSelectedInput.value =
+                    JSON.stringify(selectedAssets);
+            }
         }
 
 
@@ -3246,6 +3944,26 @@ document.addEventListener('DOMContentLoaded', function () {
 
                     if (!response.ok) {
                         if (response.status === 422 && result.errors) {
+
+                            if (result.errors.it_internal_number) {
+                                const internalNumberInput = document.getElementById(
+                                    `editAssetItInternalNumber${assetId}`
+                                );
+                                const internalNumberFeedback = document.getElementById(
+                                    `editAssetItInternalNumberFeedback${assetId}`
+                                );
+
+                                if (internalNumberInput && internalNumberFeedback) {
+                                    internalNumberInput.classList.add('is-invalid');
+                                    internalNumberFeedback.textContent =
+                                        result.errors.it_internal_number[0] +
+                                        ' Review the asset data or manually change the sequential number before saving.';
+                                    internalNumberInput.focus();
+                                }
+
+                                return;
+                            }
+
                             const validationMessages = Object.values(
                                 result.errors
                             ).flat();
@@ -3257,6 +3975,17 @@ document.addEventListener('DOMContentLoaded', function () {
                             result.message || 'The asset could not be updated.'
                         );
                     }
+
+                    /*
+                    |--------------------------------------------------------------------------
+                    | Update reset baseline after successful save
+                    |--------------------------------------------------------------------------
+                    |
+                    | The values that were successfully saved now become the new
+                    | original values for this modal.
+                    |
+                    */
+                    commitInventoryEditFormDefaults(form);
 
                     /*
                     * Request the current filtered page and copy only the updated
@@ -3310,6 +4039,55 @@ document.addEventListener('DOMContentLoaded', function () {
                                 currentCells[index].innerHTML =
                                     refreshedCells[index].innerHTML;
                             }
+                        }
+                    } else if (currentRow && !refreshedRow) {
+                        /*
+                         * If the updated asset no longer matches the active filters,
+                         * remove it immediately from the current table view.
+                         * This is especially useful for the temporary v1.8
+                         * "Hide already assigned to maintenance" filter.
+                         */
+                        currentRow.remove();
+
+                        /* Remove hidden asset from the persistent selection too. */
+                        const updatedSelection = getSelectedAssets().filter(
+                            function (selectedId) {
+                                return String(selectedId) !== assetId;
+                            }
+                        );
+
+                        sessionStorage.setItem(
+                            selectionStorageKey,
+                            JSON.stringify(updatedSelection)
+                        );
+
+                        const selectionCounter = document.getElementById(
+                            'inventorySelectionCounter'
+                        );
+
+                        if (selectionCounter) {
+                            selectionCounter.textContent =
+                                updatedSelection.length === 1
+                                    ? '1 selected'
+                                    : `${updatedSelection.length} selected`;
+                        }
+
+                        const exportSelectedInput = document.getElementById(
+                            'exportSelectedAssetIds'
+                        );
+
+                        if (exportSelectedInput) {
+                            exportSelectedInput.value =
+                                JSON.stringify(updatedSelection);
+                        }
+
+                        const exportSelectedButton = document.getElementById(
+                            'exportSelectedAssetsButton'
+                        );
+
+                        if (exportSelectedButton) {
+                            exportSelectedButton.disabled =
+                                updatedSelection.length === 0;
                         }
                     }
 
@@ -3523,7 +4301,12 @@ document.addEventListener('DOMContentLoaded', function () {
                         function (field) {
 
                             if (field) {
-                                field.readOnly = true;
+                                if (field.tagName === 'SELECT') {
+                                    field.disabled = true;
+                                } else {
+                                    field.readOnly = true;
+                                }
+
                                 field.classList.add('bg-light');
                             }
                         }
@@ -3537,7 +4320,12 @@ document.addEventListener('DOMContentLoaded', function () {
                         function (field) {
 
                             if (field) {
-                                field.readOnly = false;
+                                if (field.tagName === 'SELECT') {
+                                    field.disabled = false;
+                                } else {
+                                    field.readOnly = false;
+                                }
+
                                 field.classList.remove('bg-light');
                             }
                         }
@@ -3566,5 +4354,122 @@ document.addEventListener('DOMContentLoaded', function () {
 
     });
     </script>
+
+
+    <!-- Inventory edit modal native reset -->
+    <script>
+    /*
+    |--------------------------------------------------------------------------
+    | Re-apply dependent UI after a native form reset
+    |--------------------------------------------------------------------------
+    |
+    | The Reset button is a real HTML type="reset" button. Therefore the
+    | browser itself restores every field to its saved/default value and this
+    | script is only responsible for recalculating IT Room visual state.
+    |
+    */
+    document.addEventListener('reset', function (event) {
+
+        const form = event.target;
+
+        if (!form.classList.contains('inventory-edit-form')) {
+            return;
+        }
+
+        /*
+         * The native reset happens after the reset event fires, so wait one
+         * event loop before re-running dependent UI logic.
+         */
+        window.setTimeout(function () {
+
+            const itRoomToggle = form.querySelector(
+                '.inventory-it-room-toggle'
+            );
+
+            if (itRoomToggle) {
+                itRoomToggle.dispatchEvent(
+                    new Event('change', { bubbles: true })
+                );
+            }
+
+            const plantSelect = form.querySelector(
+                '.inventory-it-room-plant'
+            );
+
+            if (
+                plantSelect &&
+                itRoomToggle &&
+                itRoomToggle.checked
+            ) {
+                plantSelect.dispatchEvent(
+                    new Event('change', { bubbles: true })
+                );
+            }
+
+            const internalNumberInput = form.querySelector(
+                'input[name="it_internal_number"]'
+            );
+
+            const internalNumberFeedback = form.querySelector(
+                '.invalid-feedback'
+            );
+
+            if (internalNumberInput) {
+                internalNumberInput.classList.remove('is-invalid');
+            }
+
+            if (internalNumberFeedback) {
+                internalNumberFeedback.textContent = '';
+            }
+
+        }, 0);
+    });
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Promote successfully saved values to the new reset baseline
+    |--------------------------------------------------------------------------
+    */
+    function commitInventoryEditFormDefaults(form) {
+
+        if (!form) {
+            return;
+        }
+
+        form.querySelectorAll('input, select, textarea').forEach(
+            function (field) {
+
+                if (
+                    field.name === '_token' ||
+                    field.name === '_method' ||
+                    field.name === 'selected_asset_ids'
+                ) {
+                    return;
+                }
+
+                if (
+                    field.type === 'checkbox' ||
+                    field.type === 'radio'
+                ) {
+                    field.defaultChecked = field.checked;
+                    return;
+                }
+
+                if (field.tagName === 'SELECT') {
+                    Array.from(field.options).forEach(
+                        function (option) {
+                            option.defaultSelected = option.selected;
+                        }
+                    );
+                    return;
+                }
+
+                field.defaultValue = field.value;
+            }
+        );
+    }
+    </script>
+    <!-- End inventory edit modal native reset -->
 
 </x-app-layout>

@@ -84,6 +84,11 @@ Route::middleware(['auth'])->group(function () {
         '/inventory/{inventory}/print-data',
         [InventoryController::class, 'downloadPrintData']
     )->name('inventory.print-data');
+    
+    Route::post(
+    '/inventory/export-selected',
+    [InventoryController::class, 'exportSelected']
+    )->name('inventory.export-selected');
 
     /*
     |--------------------------------------------------------------------------
@@ -182,6 +187,11 @@ Route::middleware(['auth'])->group(function () {
         '/maintenance/{inventory}/assign',
         [MaintenanceController::class, 'assign']
     )->name('maintenance.assign');
+
+    Route::delete(
+        '/maintenance/{inventory}/assignment',
+        [MaintenanceController::class, 'unassign']
+    )->name('maintenance.unassign');
 
 });
 

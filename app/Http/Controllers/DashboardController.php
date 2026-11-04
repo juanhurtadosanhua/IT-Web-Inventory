@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Inventory;
 use App\Models\User;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
 class DashboardController extends Controller
@@ -125,6 +126,16 @@ class DashboardController extends Controller
 
         $activeAssets = $inventoryQuery()
             ->where('state', 'active')
+            ->count();
+
+        /*
+            Count assets located specifically in IT Room.
+
+            Using $inventoryQuery() keeps this KPI synchronized with the
+            dashboard's global plant filter.
+        */
+        $itRoomAssetsCount = $inventoryQuery()
+            ->where('location', 'IT Room')
             ->count();
 
         $maintenanceAssets = $inventoryQuery()
@@ -326,6 +337,442 @@ class DashboardController extends Controller
             ->get();
 
         /*
+        |--------------------------------------------------------------------------
+        | Maintenance dashboard charts
+        |--------------------------------------------------------------------------
+        |
+        | These queries use $inventoryQuery(), so they automatically respect the
+        | selected plant filter from the dashboard.
+        */
+
+        /*
+            Doughnut chart data:
+            Count maintenance records that already have a responsible account,
+            grouped by plant.
+        */
+        $assignedMaintenancesByPlant = $inventoryQuery()
+            ->select('plant', DB::raw('COUNT(*) as total'))
+            ->whereNotNull('next_maintenance')
+            ->whereNotNull('maintenance_responsible_id')
+            ->whereNotNull('plant')
+            ->where('plant', '<>', '')
+            ->groupBy('plant')
+            ->orderByDesc('total')
+            ->get();
+
+        /*
+        |--------------------------------------------------------------------------
+        | Maintenance status chart
+        |--------------------------------------------------------------------------
+        |
+        | Pending, overdue and in-review maintenance records come from the active
+        | inventory data. Completed maintenance records come from maintenance_records,
+        | because approved records are kept as historical records there.
+        */
+
+        /*
+            Count approved maintenance history records.
+
+            The join with inventory allows the global plant filter to remain consistent
+            with every other dashboard metric.
+        */
+        $completedMaintenancesQuery = DB::table('maintenance_records as maintenance_record')
+            ->join(
+                'inventory as inventory_asset',
+                'inventory_asset.id',
+                '=',
+                'maintenance_record.inventory_id'
+            )
+            ->where('maintenance_record.status', 'completed');
+
+        if (!$isAllPlantsSelected && $selectedPlants->isNotEmpty()) {
+            $completedMaintenancesQuery->whereIn(
+                'inventory_asset.plant',
+                $selectedPlants->toArray()
+            );
+        }
+
+        $completedMaintenancesCount = $completedMaintenancesQuery->count();
+
+        /*
+            Active maintenance records still remain in inventory.
+
+            Completed is intentionally excluded here because it is counted from
+            maintenance_records above, preventing an approved maintenance from being
+            counted twice.
+        */
+        $maintenanceStatusSummary = $inventoryQuery()
+            ->selectRaw(
+                "CASE
+                    WHEN maintenance_status = 'awaiting' THEN 'In Review'
+                    WHEN next_maintenance < ? THEN 'Overdue'
+                    ELSE 'Pending'
+                END as status, COUNT(*) as total",
+                [$maintenanceToday->toDateString()]
+            )
+            ->whereNotNull('next_maintenance')
+            ->where('maintenance_status', '<>', 'completed')
+            ->groupBy('status')
+            ->get()
+            ->keyBy('status');
+
+        /*
+            Fixed display order for the maintenance status chart.
+        */
+        $maintenanceStatusLabels = [
+            'Overdue',
+            'Pending',
+            'In Review',
+            'Completed',
+        ];
+
+        $maintenanceStatusData = collect($maintenanceStatusLabels)
+            ->map(function ($status) use (
+                $maintenanceStatusSummary,
+                $completedMaintenancesCount
+            ) {
+                if ($status === 'Completed') {
+                    return (int) $completedMaintenancesCount;
+                }
+
+                return (int) ($maintenanceStatusSummary->get($status)?->total ?? 0);
+            })
+            ->toArray();
+
+        /*
+            Convert the plant chart collection into plain arrays for @json() in Blade.
+        */
+        $assignedMaintenancesByPlantLabels = $assignedMaintenancesByPlant
+            ->pluck('plant')
+            ->toArray();
+
+        $assignedMaintenancesByPlantData = $assignedMaintenancesByPlant
+            ->pluck('total')
+            ->toArray();
+
+        /*
+        |--------------------------------------------------------------------------
+        | Warranty dashboard charts
+        |--------------------------------------------------------------------------
+        |
+        | These queries use $inventoryQuery(), so they automatically respect the
+        | selected plant filter from the dashboard.
+        */
+
+        /*
+            Doughnut chart data:
+            Count assets that have a warranty expiry date, grouped by category.
+        */
+        $warrantiesByCategory = $inventoryQuery()
+            ->select('category', DB::raw('COUNT(*) as total'))
+            ->whereNotNull('warranty_expiry_date')
+            ->whereNotNull('category')
+            ->where('category', '<>', '')
+            ->groupBy('category')
+            ->orderByDesc('total')
+            ->get();
+
+        /*
+            Bar chart data:
+            - Expired: warranty date is before today.
+            - Expiring Soon: warranty expires from today through the next 14 days.
+            - Active: warranty expires after the next 14 days.
+        */
+        $warrantyStatusSummary = $inventoryQuery()
+            ->selectRaw(
+                "CASE
+                    WHEN warranty_expiry_date < ? THEN 'Expired'
+                    WHEN warranty_expiry_date <= ? THEN 'Expiring Soon'
+                    ELSE 'Active'
+                END as status, COUNT(*) as total",
+                [
+                    $warrantyToday->toDateString(),
+                    $warrantyFourteenDaysLimit->toDateString(),
+                ]
+            )
+            ->whereNotNull('warranty_expiry_date')
+            ->groupBy('status')
+            ->get()
+            ->keyBy('status');
+
+        /*
+            Fixed display order for the warranty status chart.
+        */
+        $warrantyStatusLabels = [
+            'Active',
+            'Expiring Soon',
+            'Expired',
+        ];
+
+        $warrantyStatusData = collect($warrantyStatusLabels)
+            ->map(fn ($status) => (int) ($warrantyStatusSummary->get($status)?->total ?? 0))
+            ->toArray();
+
+        /*
+            Convert the doughnut chart collection into plain arrays for @json() in Blade.
+        */
+        $warrantiesByCategoryLabels = $warrantiesByCategory
+            ->pluck('category')
+            ->toArray();
+
+        $warrantiesByCategoryData = $warrantiesByCategory
+            ->pluck('total')
+            ->toArray();
+
+        /*
+        |--------------------------------------------------------------------------
+        | Asset Intelligence - zero data-entry analysis
+        |--------------------------------------------------------------------------
+        |
+        | This first version only reads the current inventory fields. It does not
+        | create records, change asset information or require new database columns.
+        |
+        | The result is calculated in memory so every finding always follows the
+        | same plant filter selected on the dashboard.
+        */
+        $intelligenceAssets = $inventoryQuery()->get();
+
+        /*
+            Build normalized identifier lists first. Empty values are ignored,
+            because an empty field is handled separately as missing information.
+        */
+        $duplicateValues = [
+            'serial_number' => $intelligenceAssets
+                ->filter(fn ($asset) => filled(trim((string) $asset->serial_number)))
+                ->groupBy(fn ($asset) => mb_strtoupper(trim((string) $asset->serial_number)))
+                ->filter(fn ($items) => $items->count() > 1)
+                ->keys()
+                ->flip(),
+            'it_internal_number' => $intelligenceAssets
+                ->filter(fn ($asset) => filled(trim((string) $asset->it_internal_number)))
+                ->groupBy(fn ($asset) => mb_strtoupper(trim((string) $asset->it_internal_number)))
+                ->filter(fn ($items) => $items->count() > 1)
+                ->keys()
+                ->flip(),
+            'asset_number' => $intelligenceAssets
+                ->filter(fn ($asset) => filled(trim((string) $asset->asset_number)))
+                ->groupBy(fn ($asset) => mb_strtoupper(trim((string) $asset->asset_number)))
+                ->filter(fn ($items) => $items->count() > 1)
+                ->keys()
+                ->flip(),
+        ];
+
+        /*
+            Only fields that are already part of the normal asset record are
+            reviewed here. No new mandatory information is introduced.
+        */
+        $intelligenceRequiredFields = [
+            'it_internal_number' => 'IT Number',
+            'serial_number' => 'Serial Number',
+            'asset_number' => 'Asset Number',
+            'category' => 'Category',
+            'brand' => 'Brand',
+            'model' => 'Model',
+            'plant' => 'Plant',
+        ];
+
+        $severityWeight = [
+            'Critical' => 1,
+            'High' => 2,
+            'Medium' => 3,
+        ];
+
+        $assetIntelligenceFindings = collect();
+
+        foreach ($intelligenceAssets as $asset) {
+            $findings = [];
+
+            /*
+                Missing information is reported as one concise finding per asset,
+                avoiding several duplicate rows for the same data-quality issue.
+            */
+            $missingFields = collect($intelligenceRequiredFields)
+                ->filter(fn ($label, $field) => blank(trim((string) $asset->{$field})))
+                ->values()
+                ->all();
+
+            if (!empty($missingFields)) {
+                $findings[] = [
+                    'type' => 'Incomplete information',
+                    'severity' => 'Medium',
+                    'recommendation' => 'Validate and complete the missing asset identification details.',
+                    'missing_fields' => implode(', ', $missingFields),
+                ];
+            }
+
+            /*
+                Identifier duplicates are high priority because they can affect
+                traceability, maintenance evidence and inventory reporting.
+            */
+            foreach ([
+                'serial_number' => 'Duplicate serial number',
+                'it_internal_number' => 'Duplicate IT Number',
+                'asset_number' => 'Duplicate asset number',
+            ] as $field => $type) {
+                $value = mb_strtoupper(trim((string) $asset->{$field}));
+
+                if ($value !== '' && isset($duplicateValues[$field][$value])) {
+                    $findings[] = [
+                        'type' => $type,
+                        'severity' => 'High',
+                        'recommendation' => 'Verify whether this identifier was duplicated or assigned incorrectly.',
+                        'missing_fields' => null,
+                    ];
+                }
+            }
+
+            /*
+                Warranty analysis uses the already existing start and expiry dates.
+                A malformed date is treated as a data-quality finding instead of
+                causing the dashboard to fail.
+            */
+            $warrantyStart = filled($asset->warranty_start_date)
+                ? Carbon::parse($asset->warranty_start_date)->startOfDay()
+                : null;
+            $warrantyExpiry = filled($asset->warranty_expiry_date)
+                ? Carbon::parse($asset->warranty_expiry_date)->startOfDay()
+                : null;
+
+            if ($warrantyStart && $warrantyExpiry && $warrantyExpiry->lt($warrantyStart)) {
+                $findings[] = [
+                    'type' => 'Invalid warranty dates',
+                    'severity' => 'High',
+                    'recommendation' => 'Validate the warranty start and expiry dates.',
+                    'missing_fields' => null,
+                ];
+            }
+
+            if ($warrantyExpiry) {
+                if ($warrantyExpiry->lt($warrantyToday)) {
+                    $findings[] = [
+                        'type' => 'Warranty expired',
+                        'severity' => 'High',
+                        'recommendation' => 'Review renewal, replacement or continued-use requirements.',
+                        'missing_fields' => null,
+                    ];
+                } elseif ($warrantyExpiry->lte($warrantyThreeMonthsLimit)) {
+                    $findings[] = [
+                        'type' => 'Warranty expiring soon',
+                        'severity' => 'Medium',
+                        'recommendation' => 'Plan the warranty review before the expiry date.',
+                        'missing_fields' => null,
+                    ];
+                }
+            }
+
+            /*
+                Completed maintenance is excluded because its evidence is kept in
+                maintenance_records. Pending and awaiting assets remain in scope.
+            */
+            if (
+                filled($asset->next_maintenance)
+                && $asset->maintenance_status !== 'completed'
+                && Carbon::parse($asset->next_maintenance)->startOfDay()->lt($maintenanceToday)
+            ) {
+                $findings[] = [
+                    'type' => 'Overdue maintenance',
+                    'severity' => 'High',
+                    'recommendation' => 'Complete the preventive maintenance and submit the required evidence.',
+                    'missing_fields' => null,
+                ];
+            }
+
+            /*
+                Existing physical condition states are converted into lifecycle
+                risks. This does not claim end-of-life or vendor support status.
+            */
+            if ($asset->state === 'damaged') {
+                $findings[] = [
+                    'type' => 'Damaged asset',
+                    'severity' => 'Critical',
+                    'recommendation' => 'Review repair, replacement or disposal requirements.',
+                    'missing_fields' => null,
+                ];
+            } elseif ($asset->state === 'degraded') {
+                $findings[] = [
+                    'type' => 'Degraded asset',
+                    'severity' => 'High',
+                    'recommendation' => 'Review the equipment condition and plan corrective action.',
+                    'missing_fields' => null,
+                ];
+            }
+
+            foreach ($findings as $finding) {
+                $assetIntelligenceFindings->push((object) array_merge($finding, [
+                    'asset_id' => $asset->id,
+                    'it_number' => $asset->it_internal_number ?: 'N/A',
+                    'category' => $asset->category ?: 'N/A',
+                    'plant' => $asset->plant ?: 'N/A',
+                    'state' => $asset->state ?: 'N/A',
+                ]));
+            }
+        }
+
+        /*
+            Classify every asset from its most severe finding. The classification
+            is display-only and is never stored back into the inventory table.
+        */
+        $assetIntelligenceFindingsByAsset = $assetIntelligenceFindings
+            ->groupBy('asset_id');
+
+        $assetIntelligenceAssetStatus = $intelligenceAssets
+            ->map(function ($asset) use ($assetIntelligenceFindingsByAsset, $severityWeight) {
+                $assetFindings = $assetIntelligenceFindingsByAsset
+                    ->get($asset->id, collect());
+
+                $highestSeverity = $assetFindings
+                    ->sortBy(fn ($finding) => $severityWeight[$finding->severity] ?? 99)
+                    ->first()
+                    ?->severity;
+
+                $lifecycleStatus = match ($highestSeverity) {
+                    'Critical' => 'Critical',
+                    'High' => 'At Risk',
+                    'Medium' => 'Attention',
+                    default => 'Healthy',
+                };
+
+                return (object) [
+                    'asset_id' => $asset->id,
+                    'lifecycle_status' => $lifecycleStatus,
+                ];
+            });
+
+        $assetIntelligenceLifecycleLabels = ['Healthy', 'Attention', 'At Risk', 'Critical'];
+        $assetIntelligenceLifecycleData = collect($assetIntelligenceLifecycleLabels)
+            ->map(fn ($status) => $assetIntelligenceAssetStatus
+                ->where('lifecycle_status', $status)
+                ->count())
+            ->toArray();
+
+        $assetIntelligenceTypeSummary = $assetIntelligenceFindings
+            ->groupBy('type')
+            ->map(fn ($findings) => $findings->count())
+            ->sortDesc();
+
+        $assetIntelligenceTypeLabels = $assetIntelligenceTypeSummary->keys()->toArray();
+        $assetIntelligenceTypeData = $assetIntelligenceTypeSummary->values()->toArray();
+        $assetIntelligenceFindingCount = $assetIntelligenceFindings->count();
+
+        /*
+            Send the complete, plant-scoped finding list to the browser. Local
+            filters and 50-row pagination then update instantly without a page
+            refresh or recalculating the dashboard.
+        */
+        $assetIntelligenceFindingsForClient = $assetIntelligenceFindings
+            ->sortBy(fn ($finding) => $severityWeight[$finding->severity] ?? 99)
+            ->values()
+            ->map(fn ($finding) => [
+                'it_number' => $finding->it_number,
+                'plant' => $finding->plant,
+                'type' => $finding->type,
+                'severity' => $finding->severity,
+                'recommendation' => $finding->recommendation,
+                'missing_fields' => $finding->missing_fields,
+            ])
+            ->all();
+
+        /*
             Prepare chart values as plain arrays.
 
             This avoids Blade parsing issues when using collection methods
@@ -467,12 +914,28 @@ class DashboardController extends Controller
             'assetsByStateData',
             'assetsByBusinessUnitLabels',
             'assetsByBusinessUnitData',
+            'assignedMaintenancesByPlantLabels',
+            'assignedMaintenancesByPlantData',
+            'maintenanceStatusLabels',
+            'maintenanceStatusData',
+            'warrantiesByCategoryLabels',
+            'warrantiesByCategoryData',
+            'warrantyStatusLabels',
+            'warrantyStatusData',
             'plants',
             'selectedPlants',
             'selectedPlantsArray',
             'isAllPlantsSelected',
             'selectedPlantLabel',
             'dashboardThemeStyle',
+            'itRoomAssetsCount',
+            'assetIntelligenceFindings',
+            'assetIntelligenceFindingCount',
+            'assetIntelligenceLifecycleLabels',
+            'assetIntelligenceLifecycleData',
+            'assetIntelligenceTypeLabels',
+            'assetIntelligenceTypeData',
+            'assetIntelligenceFindingsForClient',
         ));
     }
 }

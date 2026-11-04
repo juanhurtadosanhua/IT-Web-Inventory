@@ -28,21 +28,55 @@ class MaintenanceController extends Controller
         }
 
         /*
+         * Scheduled cycles remain hidden until they enter the
+         * 7-day activation window.
+         */
+        $this->activateScheduledMaintenanceCycles();
+
+        /*
          * Consulta base del módulo.
          * Se reutiliza para construir la tabla y las opciones dinámicas
          * de Category y Location.
          */
         $baseQuery = Inventory::query()
             ->with('maintenanceResponsible')
-            ->whereNotNull('maintenance_responsible_id')
-            ->where('maintenance_status', '!=', 'completed');
+            ->whereNotNull('maintenance_responsible_id');
 
         /*
-         * Admin puede consultar todos los mantenimientos.
-         * User solamente puede consultar los asignados a su propia cuenta.
+         * Admin puede consultar los mantenimientos activos y también
+         * los ciclos futuros almacenados como Scheduled.
+         *
+         * User solamente ve mantenimientos activos asignados a su cuenta.
+         * Los Scheduled permanecen ocultos hasta que entren en la ventana
+         * de 7 días y activateScheduledMaintenanceCycles() los convierta
+         * automáticamente a Pending.
          */
-        if ($user->user_level !== 'Admin') {
-            $baseQuery->where('maintenance_responsible_id', $user->id);
+        if ($user->user_level === 'Admin') {
+            $baseQuery->whereIn('maintenance_status', [
+                'pending',
+                'awaiting',
+                'scheduled',
+            ]);
+        } else {
+            $baseQuery
+                ->where('maintenance_responsible_id', $user->id)
+                ->where(function ($maintenanceQuery) {
+                    $maintenanceQuery
+                        ->where('maintenance_status', 'awaiting')
+                        ->orWhere(function ($pendingQuery) {
+                            $pendingQuery
+                                ->where('maintenance_status', 'pending')
+                                ->where(function ($dateQuery) {
+                                    $dateQuery
+                                        ->whereNull('next_maintenance')
+                                        ->orWhereDate(
+                                            'next_maintenance',
+                                            '<=',
+                                            today()->addDays(7)
+                                        );
+                                });
+                        });
+                });
         }
 
         $query = clone $baseQuery;
@@ -133,6 +167,13 @@ class MaintenanceController extends Controller
             if ($maintenanceStatus === 'awaiting') {
                 $query->where('maintenance_status', 'awaiting');
             }
+
+            if (
+                $maintenanceStatus === 'scheduled'
+                && $user->user_level === 'Admin'
+            ) {
+                $query->where('maintenance_status', 'scheduled');
+            }
         }
 
         /*
@@ -141,6 +182,7 @@ class MaintenanceController extends Controller
          */
         $maintenanceResponsibleOptions = User::query()
             ->where('is_active', true)
+            ->where('user_level', 'User')
             ->orderBy('name')
             ->get(['id', 'name', 'employee_number']);
 
@@ -300,8 +342,10 @@ class MaintenanceController extends Controller
          *
          * Solo Admin.
          */
-        public function approve(Inventory $inventory)
-        {
+        public function approve(
+            Request $request,
+            Inventory $inventory
+        ) {
             $this->ensureAdmin();
 
             if ($inventory->maintenance_status !== 'awaiting') {
@@ -313,9 +357,34 @@ class MaintenanceController extends Controller
                     );
             }
 
-            $admin = auth()->user();
+            $validated = $request->validate([
+                'next_maintenance' => [
+                    'required',
+                    'date',
+                    'after:today',
+                ],
 
-            DB::transaction(function () use ($inventory, $admin) {
+                'maintenance_responsible_id' => [
+                    'required',
+                    'integer',
+
+                    Rule::exists('users', 'id')->where(
+                        fn ($query) => $query
+                            ->where('is_active', true)
+                            ->where('user_level', 'User')
+                    ),
+                ],
+            ]);
+
+            $admin = auth()->user();
+            $completedAt = now();
+
+            DB::transaction(function () use (
+                $inventory,
+                $admin,
+                $validated,
+                $completedAt
+            ) {
                 $record = MaintenanceRecord::query()
                     ->where('inventory_id', $inventory->id)
                     ->where('status', 'awaiting')
@@ -326,21 +395,42 @@ class MaintenanceController extends Controller
                     $record->update([
                         'status' => 'completed',
                         'reviewed_by' => $admin->id,
-                        'reviewed_at' => now(),
-                        'completed_at' => now(),
+                        'reviewed_at' => $completedAt,
+                        'completed_at' => $completedAt,
                         'rejection_reason' => null,
                     ]);
                 }
 
+                /*
+                 * The next cycle is stored immediately as scheduled.
+                 * It is automatically activated as pending when it is 7 days away or less.
+                 */
                 $inventory->update([
-                    'maintenance_status' => 'completed',
+                    'next_maintenance' =>
+                        $validated['next_maintenance'],
+
+                    'maintenance_responsible_id' =>
+                        $validated['maintenance_responsible_id'],
+
+                    'maintenance_status' => 'scheduled',
+                ]);
+
+                MaintenanceRecord::create([
+                    'inventory_id' => $inventory->id,
+                    'maintenance_date' =>
+                        $validated['next_maintenance'],
+
+                    'responsible_id' =>
+                        $validated['maintenance_responsible_id'],
+
+                    'status' => 'scheduled',
                 ]);
 
                 ActivityLogger::log(
                     module: 'maintenance',
                     action: 'approved',
                     description:
-                        'Maintenance was approved for item '
+                        'Maintenance was approved and the next cycle was scheduled for item '
                         . $this->inventoryIdentifier($inventory)
                         . '.',
                     targetType: 'inventory',
@@ -349,9 +439,14 @@ class MaintenanceController extends Controller
                         'maintenance_status' => 'awaiting',
                     ],
                     newValues: [
-                        'maintenance_status' => 'completed',
+                        'maintenance_status' => 'scheduled',
                         'reviewed_by' => $admin->id,
-                        'completed_at' => now()->toDateTimeString(),
+                        'completed_at' =>
+                            $completedAt->toDateTimeString(),
+                        'next_maintenance' =>
+                            $validated['next_maintenance'],
+                        'maintenance_responsible_id' =>
+                            $validated['maintenance_responsible_id'],
                     ]
                 );
             });
@@ -360,7 +455,7 @@ class MaintenanceController extends Controller
                 ->route('maintenance.index')
                 ->with(
                     'success',
-                    'Maintenance approved successfully.'
+                    'Maintenance approved. The next maintenance cycle was scheduled successfully.'
                 );
         }
 
@@ -635,6 +730,235 @@ class MaintenanceController extends Controller
             ->with(
                 'success',
                 'Maintenance responsible assigned successfully.'
+            );
+    }
+
+    /**
+     * Activate scheduled maintenance cycles when they enter the
+     * 7-day execution window.
+     *
+     * A scheduled cycle is already assigned and has a future date,
+     * but should not be treated as active work until this point.
+     */
+    private function activateScheduledMaintenanceCycles(): void
+    {
+        $activationLimit = today()->addDays(7);
+
+        $scheduledItems = Inventory::query()
+            ->where('maintenance_status', 'scheduled')
+            ->whereNotNull('next_maintenance')
+            ->whereDate('next_maintenance', '<=', $activationLimit)
+            ->get();
+
+        foreach ($scheduledItems as $inventory) {
+            DB::transaction(function () use ($inventory) {
+                $inventory->update([
+                    'maintenance_status' => 'pending',
+                ]);
+
+                MaintenanceRecord::query()
+                    ->where('inventory_id', $inventory->id)
+                    ->where('status', 'scheduled')
+                    ->whereDate(
+                        'maintenance_date',
+                        $inventory->next_maintenance
+                    )
+                    ->latest()
+                    ->first()
+                    ?->update([
+                        'status' => 'pending',
+                    ]);
+
+                ActivityLogger::log(
+                    module: 'maintenance',
+                    action: 'scheduled_cycle_activated',
+                    description:
+                        'Scheduled maintenance entered the 7-day execution window for item '
+                        . $this->inventoryIdentifier($inventory)
+                        . '.',
+                    targetType: 'inventory',
+                    targetId: $inventory->id,
+                    oldValues: [
+                        'maintenance_status' => 'scheduled',
+                    ],
+                    newValues: [
+                        'maintenance_status' => 'pending',
+                        'next_maintenance' =>
+                            $inventory->next_maintenance?->format('Y-m-d'),
+                    ]
+                );
+            });
+        }
+    }
+
+    /**
+     * Reopen approved maintenance cycles after three calendar months.
+     *
+     * This is executed whenever an authorized user opens the
+     * Maintenance module. No Windows task or Laravel scheduler is needed.
+     */
+    private function expireCompletedMaintenanceCycles(): void
+    {
+        $expirationDate = now()->subMonthsNoOverflow(3);
+
+        $completedRecords = MaintenanceRecord::query()
+            ->where('status', 'completed')
+            ->whereNotNull('completed_at')
+            ->where('completed_at', '<=', $expirationDate)
+            ->orderBy('id')
+            ->get();
+
+        foreach ($completedRecords as $completedRecord) {
+            DB::transaction(function () use ($completedRecord) {
+
+                $inventory = Inventory::query()
+                    ->whereKey($completedRecord->inventory_id)
+                    ->lockForUpdate()
+                    ->first();
+
+                /*
+                * If the asset is no longer completed, it already has a new
+                * cycle or was manually updated. Do not duplicate anything.
+                */
+                if (
+                    !$inventory
+                    || $inventory->maintenance_status !== 'completed'
+                ) {
+                    return;
+                }
+
+                /*
+                * Only the latest approved maintenance of the asset can
+                * generate a new automatic maintenance cycle.
+                */
+                $latestCompletedRecordId = MaintenanceRecord::query()
+                    ->where('inventory_id', $inventory->id)
+                    ->where('status', 'completed')
+                    ->orderByDesc('completed_at')
+                    ->orderByDesc('id')
+                    ->value('id');
+
+                if (
+                    (int) $latestCompletedRecordId
+                    !== (int) $completedRecord->id
+                ) {
+                    return;
+                }
+
+                $nextMaintenanceDate = $completedRecord->completed_at
+                    ->copy()
+                    ->addMonthsNoOverflow(3)
+                    ->toDateString();
+
+                /*
+                * Keep the currently assigned responsible person.
+                */
+                $responsibleId = $inventory->maintenance_responsible_id
+                    ?? $completedRecord->responsible_id;
+
+                $inventory->update([
+                    'next_maintenance' => $nextMaintenanceDate,
+                    'maintenance_responsible_id' => $responsibleId,
+                    'maintenance_status' => 'pending',
+                ]);
+
+                MaintenanceRecord::create([
+                    'inventory_id' => $inventory->id,
+                    'maintenance_date' => $nextMaintenanceDate,
+                    'responsible_id' => $responsibleId,
+                    'status' => 'pending',
+                ]);
+
+                ActivityLogger::log(
+                    module: 'maintenance',
+                    action: 'cycle_expired',
+                    description: 'A new maintenance cycle was automatically opened for item '
+                        . (
+                            $inventory->it_internal_number
+                            ?? $inventory->serial_number
+                            ?? $inventory->asset_number
+                            ?? $inventory->id
+                        )
+                        . '.',
+                    targetType: 'inventory',
+                    targetId: $inventory->id,
+                    oldValues: [
+                        'maintenance_status' => 'completed',
+                        'completed_at' => $completedRecord->completed_at
+                            ->toDateTimeString(),
+                    ],
+                    newValues: [
+                        'maintenance_status' => 'pending',
+                        'next_maintenance' => $nextMaintenanceDate,
+                        'maintenance_responsible_id' => $responsibleId,
+                    ]
+                );
+            });
+        }
+    }
+
+    /**
+     * Remove the responsible person from a pending maintenance cycle.
+     */
+    public function unassign(Inventory $inventory)
+    {
+        if ($inventory->maintenance_status !== 'pending') {
+            return redirect()
+                ->back()
+                ->with(
+                    'warning',
+                    'Only pending maintenance activities can be cancelled.'
+                );
+        }
+
+        if (!$inventory->maintenance_responsible_id) {
+            return redirect()
+                ->back()
+                ->with(
+                    'warning',
+                    'This maintenance does not have an assigned responsible.'
+                );
+        }
+
+        $oldResponsibleId = $inventory->maintenance_responsible_id;
+
+        DB::transaction(function () use ($inventory, $oldResponsibleId) {
+            $inventory->update([
+                'maintenance_responsible_id' => null,
+            ]);
+
+            /*
+            * Keep the active maintenance record aligned with Inventory.
+            */
+            $record = $this->getCurrentMaintenanceRecord($inventory);
+
+            $record->update([
+                'responsible_id' => null,
+            ]);
+
+            ActivityLogger::log(
+                module: 'maintenance',
+                action: 'assignment_cancelled',
+                description:
+                    'Maintenance assignment was cancelled for item '
+                    . $this->inventoryIdentifier($inventory)
+                    . '.',
+                targetType: 'inventory',
+                targetId: $inventory->id,
+                oldValues: [
+                    'maintenance_responsible_id' => $oldResponsibleId,
+                ],
+                newValues: [
+                    'maintenance_responsible_id' => null,
+                ]
+            );
+        });
+
+        return redirect()
+            ->back()
+            ->with(
+                'success',
+                'Maintenance assignment cancelled successfully.'
             );
     }
 

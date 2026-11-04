@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Http\Controllers\Controller;
 use App\Imports\InventoryImport;
+use App\Models\MaintenanceRecord;
 use App\Models\Inventory;
 use App\Models\InventoryImportRow;
 use App\Models\User; //IMPORTAR MODELO USUARIO PARA USARSE EN LA RELACION DE INVENTARIO
@@ -14,7 +15,9 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 use Maatwebsite\Excel\Facades\Excel;
+use App\Exports\SelectedInventoryExport; //MODELO DE EXPORTACION DE INVENTARIO SELECCIONADO A PLANTILLA EXCEL
 
 class InventoryController extends Controller
 {
@@ -166,6 +169,15 @@ class InventoryController extends Controller
             $inventoryQuery->where('maintenance_responsible_id', $request->maintenance_responsible_id);
         }
 
+        /*
+         * Temporary v1.8 helper:
+         * hide assets that already have a maintenance responsible assigned.
+         * This is applied before pagination so every page stays consistent.
+         */
+        if ($request->boolean('hide_maintenance_assigned')) {
+            $inventoryQuery->whereNull('maintenance_responsible_id');
+        }
+
         if ($request->filled('maintenance_status')) {
             $maintenanceStatus = $request->maintenance_status;
 
@@ -188,6 +200,10 @@ class InventoryController extends Controller
                     ->where('maintenance_status', 'pending')
                     ->whereNotNull('next_maintenance')
                     ->whereDate('next_maintenance', '<', today());
+            }
+
+            if ($maintenanceStatus === 'scheduled') {
+                $inventoryQuery->where('maintenance_status', 'scheduled');
             }
         }
 
@@ -273,6 +289,21 @@ class InventoryController extends Controller
                 ->appends($request->query()),
 
             'categoryOptions' => $this->categoryOptions(),
+            'categoryAcronymMap' => $this->categoryAcronyms(),
+            'plantCodeMap' => $this->plantCodes(),
+            'departmentAcronymMap' => $this->departmentAcronyms(),
+            'departmentOptions' => array_keys($this->departmentAcronyms()),
+            'nextSequentialByCategory' => $this->nextSequentialByCategory(),
+            'autoInternalNumberYear' => now()->year,
+            'existingInternalNumberRecords' => Inventory::query()
+                ->whereNotNull('it_internal_number')
+                ->where('it_internal_number', '<>', '')
+                ->get(['id', 'it_internal_number'])
+                ->map(fn ($item) => [
+                    'id' => (int) $item->id,
+                    'number' => (string) $item->it_internal_number,
+                ])
+                ->values(),
             'classificationOptions' => $this->classificationOptions(),
             'plantOptions' => $plantOptions,
             'maintenanceResponsibleOptions' => $maintenanceResponsibleOptions,
@@ -505,6 +536,25 @@ private function inventoryLogFields(): array
 
     $canManageMaintenance = $this->canManageMaintenance();
 
+        /*
+        |--------------------------------------------------------------------------
+        | IT Internal Number mode - v1.8.2
+        |--------------------------------------------------------------------------
+        |
+        | The value shown in automatic mode is only a browser preview. Remove it
+        | from the request before validation so Laravel always recalculates the
+        | definitive number at save time.
+        |
+        */
+        $automaticInternalNumber =
+            $request->input('it_internal_number_mode', 'auto') !== 'manual';
+
+        if ($automaticInternalNumber) {
+            $request->merge([
+                'it_internal_number' => null,
+            ]);
+        }
+
         $validated = $request->validate([
             'it_internal_number' => ['nullable', 'string', 'max:255', 'unique:inventory,it_internal_number'],
             'serial_number' => ['nullable', 'string', 'max:255'],
@@ -512,14 +562,14 @@ private function inventoryLogFields(): array
             'description' => ['nullable', 'string'],
             'model' => ['nullable', 'string', 'max:255'],
             'brand' => ['nullable', 'string', 'max:255'],
-            'category' => ['nullable', Rule::in($this->categoryOptions())],
+            'category' => ['required', Rule::in($this->categoryOptions())],
             'warranty_start_date' => ['nullable', 'date'],
             'warranty_expiry_date' => ['nullable', 'date', 'after_or_equal:warranty_start_date'],
             'purchase_origin_country' => ['nullable', 'string', 'max:255'],
-            'department' => ['nullable', 'string', 'max:255'],
+            'department' => ['required', 'string', 'max:255', Rule::in(array_keys($this->departmentAcronyms()))],
             'location' => ['nullable', 'string', 'max:255'],
             'business_unit' => ['nullable', 'string', 'max:255'],
-            'plant' => ['nullable', 'string', 'max:255'],
+            'plant' => ['required', 'string', 'max:255', Rule::in(array_keys($this->plantCodes()))],
             'end_user' => ['required', 'string', 'max:255'],
             'responsive' => ['nullable', 'boolean'],
             'employee_id' => ['nullable', 'string', 'max:255'],
@@ -565,6 +615,23 @@ private function inventoryLogFields(): array
         |
         */
         $validated = $this->applyItRoomResponsible($validated);
+
+        /*
+        |--------------------------------------------------------------------------
+        | Automatic IT Internal Number - v1.8.2
+        |--------------------------------------------------------------------------
+        |
+        | Only generate when the field was intentionally left empty.
+        | A manually entered value is preserved exactly as submitted.
+        |
+        */
+        if (
+            $automaticInternalNumber ||
+            blank($validated['it_internal_number'] ?? null)
+        ) {
+            $validated['it_internal_number'] =
+                $this->generateItInternalNumber($validated);
+        }
 
         $inventory = Inventory::create($validated);
 
@@ -619,6 +686,7 @@ private function inventoryLogFields(): array
             'Bracket',
             'Camera',
             'CAMERA Mount',
+            'Cellphone',
             'Charger',
             'Clock',
             'Desktop',
@@ -635,6 +703,9 @@ private function inventoryLogFields(): array
             'Memory',
             'Mobile WiFi',
             'Monitor',
+            'Multicontactos',
+            'Magnetic Lock',
+            'N7007',
             'NAS',
             'NVR',
             'PatchPanel',
@@ -650,8 +721,210 @@ private function inventoryLogFields(): array
             'Speaker',
             'Switch',
             'Tablet',
+            'TV',
+            'Disco duro',
             'UPS',
         ];
+    }
+
+    /**
+     * Temporary v1.8.2 category -> acronym mapping used by the
+     * automatic IT Internal Number generator.
+     *
+     * Keep this isolated so the mapping can be adjusted later without
+     * changing the generation logic.
+     */
+    private function categoryAcronyms(): array
+    {
+        return [
+            'Access Controller' => 'AP',
+            'Camera' => 'CAM',
+            'Digital Video Recorder' => 'CAM',
+            'Cellphone' => 'CEL',
+            'Printer' => 'IMP',
+            'Scanner' => 'IMP',
+            'Laptop' => 'LAP',
+            'Monitor' => 'MON',
+            'Projector' => 'MON',
+            'Speaker' => 'MON',
+            'NVR' => 'NVR',
+            'Desktop' => 'PC',
+            'Industrial PC' => 'PC',
+            'Keyboard' => 'PC',
+            'Server' => 'PC',
+            'Memory' => 'PC',
+            'Service' => 'SERVICE',
+            'Switch' => 'SWI',
+            'PatchPanel' => 'SWI',
+            'Multicontactos' => 'SWI',
+            'Bracket' => 'SWI',
+            'Magnetic Lock' => 'SWI',
+            'N7007' => 'SWI',
+            'Clock' => 'SWI',
+            'Radio' => 'SWI',
+            'Power Module' => 'SWI',
+            'NAS' => 'SWI',
+            'SD-WAN' => 'SWI',
+            'Kit Tools' => 'SWI',
+            'Mobile WiFi' => 'SWI',
+            'Tablet' => 'TAB',
+            'PDA' => 'TAB',
+            'TV' => 'TV',
+            'Disco duro' => 'UBI',
+            'UPS' => 'UPS',
+        ];
+    }
+
+    /**
+     * Temporary v1.8.2 plant -> MX code mapping.
+     */
+    private function plantCodes(): array
+    {
+        return [
+            'G' => 'MX1',
+            'H' => 'MX2',
+            'B' => 'MX3',
+            'D' => 'MX4',
+            'MP' => 'MX5',
+            'MPI' => 'MX5',
+            'MPII' => 'MX5',
+        ];
+    }
+
+    /**
+     * Temporary v1.8.2 department -> acronym mapping.
+     * These values are intentionally centralized because the official
+     * department acronyms are still being defined.
+     */
+    private function departmentAcronyms(): array
+    {
+        return [
+            'Administration' => 'ADM',
+            'BU3 Production' => 'BU3',
+            'BU6' => 'BU6',
+            'BU6 Quality Team' => 'BU6Q',
+            'Chiller Production' => 'CHP',
+            'Purchasing' => 'PUR',
+            'CSR' => 'CSR',
+            'EHS' => 'EHS',
+            'Engineering' => 'ENG',
+            'Facilities' => 'FAC',
+            'Finance' => 'FIN',
+            'First Floor' => 'FF',
+            'HR' => 'HR',
+            'IT' => 'IT',
+            'IT Room' => 'IT',
+            'Launches' => 'LAU',
+            'Lean Manufacturing' => 'LM',
+            'Logistics' => 'LOG',
+            'Maintenance' => 'MNT',
+            'Manufacturing' => 'MFG',
+            'Quality' => 'QLTY',
+        ];
+    }
+
+    /**
+     * Read the greatest historical sequential number for one category.
+     *
+     * The regex only trusts IT numbers that end in "-NUMBER-YEAR" so
+     * malformed historical values do not break automatic generation.
+     */
+    private function highestSequentialForCategory(?string $category): int
+    {
+        if (!$category) {
+            return 0;
+        }
+
+        $highest = 0;
+
+        Inventory::query()
+            ->where('category', $category)
+            ->whereNotNull('it_internal_number')
+            ->pluck('it_internal_number')
+            ->each(function ($internalNumber) use (&$highest) {
+                if (!is_string($internalNumber)) {
+                    return;
+                }
+
+                if (preg_match('/-(\\d+)-(\\d{4})$/', trim($internalNumber), $matches)) {
+                    $highest = max($highest, (int) $matches[1]);
+                }
+            });
+
+        return $highest;
+    }
+
+    /**
+     * Preview data sent to the Create modal.
+     */
+    private function nextSequentialByCategory(): array
+    {
+        $result = [];
+
+        foreach (array_keys($this->categoryAcronyms()) as $category) {
+            $result[$category] = $this->highestSequentialForCategory($category) + 1;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Generate the definitive IT Internal Number for a newly-created asset.
+     * The sequence is recalculated at save time; the browser preview is never
+     * treated as authoritative.
+     */
+    private function generateItInternalNumber(array $data): string
+    {
+        $category = $data['category'] ?? null;
+        $plant = $data['plant'] ?? null;
+        $department = $data['department'] ?? null;
+
+        $categoryCode = $this->categoryAcronyms()[$category] ?? null;
+        $plantCode = $this->plantCodes()[$plant] ?? null;
+        $departmentCode = $this->departmentAcronyms()[$department] ?? null;
+
+        $missing = [];
+
+        if (!$categoryCode) {
+            $missing['category'] = 'Select a category with an automatic acronym configured.';
+        }
+
+        if (!$plantCode) {
+            $missing['plant'] = 'Select a plant with an automatic MX code configured.';
+        }
+
+        if (!$departmentCode) {
+            $missing['department'] = 'Select a department with an automatic acronym configured.';
+        }
+
+        if (!empty($missing)) {
+            throw ValidationException::withMessages($missing);
+        }
+
+        $sequence = $this->highestSequentialForCategory($category) + 1;
+        $year = now()->year;
+
+        do {
+            $formattedSequence = str_pad((string) $sequence, 3, '0', STR_PAD_LEFT);
+
+            $candidate = implode('-', [
+                $categoryCode,
+                $plantCode,
+                $departmentCode,
+                $formattedSequence,
+                $year,
+            ]);
+
+            $exists = Inventory::query()
+                ->where('it_internal_number', $candidate)
+                ->exists();
+
+            if ($exists) {
+                $sequence++;
+            }
+        } while ($exists);
+
+        return $candidate;
     }
 
     private function classificationOptions(): array
@@ -923,6 +1196,20 @@ private function inventoryLogFields(): array
 
         /*
         |--------------------------------------------------------------------------
+        | Save original values for Activity Log
+        |--------------------------------------------------------------------------
+        |
+        | These values must be captured before fill() modifies the model in memory.
+        | Otherwise the later comparison could treat the new values as the old ones
+        | and skip the activity log even when the asset was actually edited.
+        |
+        */
+        $originalInventoryValues = $inventory->only(
+            $this->inventoryLogFields()
+        );
+
+        /*
+        |--------------------------------------------------------------------------
         | Determine exactly which fields were changed
         |--------------------------------------------------------------------------
         |
@@ -965,7 +1252,8 @@ private function inventoryLogFields(): array
             $validated,
             $selectedIds,
             $isBulkEdit,
-            $bulkChangedFields
+            $bulkChangedFields,
+            $originalInventoryValues
         ) {
 
             $updatedCount = 0;
@@ -976,9 +1264,7 @@ private function inventoryLogFields(): array
             | Update the asset whose modal was opened
             |--------------------------------------------------------------------------
             */
-            $oldValues = $inventory->only(
-                $this->inventoryLogFields()
-            );
+            $oldValues = $originalInventoryValues;
 
             /*
             * The model was already filled above while detecting dirty fields.
@@ -988,6 +1274,36 @@ private function inventoryLogFields(): array
             $inventory->fill($validated);
 
             $inventory->save();
+
+            /*
+            |--------------------------------------------------------------------------
+            | Keep the active maintenance record synchronized
+            |--------------------------------------------------------------------------
+            */
+            if (
+                $inventory->wasChanged([
+                    'next_maintenance',
+                    'maintenance_responsible_id',
+                ])
+                && in_array(
+                    $inventory->maintenance_status,
+                    ['pending', 'awaiting', 'scheduled'],
+                    true
+                )
+            ) {
+                $maintenanceRecord = MaintenanceRecord::query()
+                    ->where('inventory_id', $inventory->id)
+                    ->whereIn('status', ['pending', 'awaiting', 'scheduled'])
+                    ->latest('id')
+                    ->first();
+
+                if ($maintenanceRecord) {
+                    $maintenanceRecord->update([
+                        'maintenance_date' => $inventory->next_maintenance,
+                        'responsible_id' => $inventory->maintenance_responsible_id,
+                    ]);
+                }
+            }
 
             $inventory->refresh();
 
@@ -1632,6 +1948,76 @@ private function inventoryLogFields(): array
         return redirect()
             ->route('inventory')
             ->with('success', 'Import cancelled successfully.');
+    }
+
+    /**
+     * Export selected inventory assets to Excel.
+     */
+    public function exportSelected(Request $request)
+    {
+        /*
+        |--------------------------------------------------------------------------
+        | Retrieve selected assets
+        |--------------------------------------------------------------------------
+        |
+        | The selected IDs come from the persistent inventory selection stored
+        | in the browser. The existing helper normalizes and removes duplicates.
+        |
+        */
+
+        $selectedIds = $this->selectedInventoryIds($request);
+
+        /*
+        |--------------------------------------------------------------------------
+        | Prevent empty exports
+        |--------------------------------------------------------------------------
+        */
+
+        if (empty($selectedIds)) {
+            return redirect()
+                ->route('inventory')
+                ->with(
+                    'warning',
+                    'Please select at least one asset before exporting.'
+                );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Verify that selected assets still exist
+        |--------------------------------------------------------------------------
+        */
+
+        $existingIds = Inventory::query()
+            ->whereIn('id', $selectedIds)
+            ->pluck('id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        if (empty($existingIds)) {
+            return redirect()
+                ->route('inventory')
+                ->with(
+                    'warning',
+                    'The selected assets could not be found.'
+                );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Generate Excel file
+        |--------------------------------------------------------------------------
+        */
+
+        $fileName =
+            'inventory_selected_assets_'
+            . now()->format('Y-m-d_H-i-s')
+            . '.xlsx';
+
+        return Excel::download(
+            new SelectedInventoryExport($existingIds),
+            $fileName
+        );
     }
 
     // Download print data for a specific inventory item
