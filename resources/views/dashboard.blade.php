@@ -2775,12 +2775,28 @@
             'warrantiesByCategoryLegend'
         );
 
-        createBarChart(
+        const warrantyStatusChart = createBarChart(
             'warrantyStatusChart',
             warrantyStatusLabels,
             warrantyStatusData,
             'Warranty Status'
         );
+
+        const warrantyStatusColors = {
+            'active': '#22c55e',        // Verde
+            'expiring soon': '#eab308', // Amarillo
+            'expired': '#ef4444'        // Rojo
+        };
+
+        const warrantyColors = warrantyStatusLabels.map((label) => {
+            const normalizedLabel = String(label).trim().toLowerCase();
+
+            return warrantyStatusColors[normalizedLabel] ?? '#94a3b8';
+        });
+
+        warrantyStatusChart.data.datasets[0].backgroundColor = warrantyColors;
+        warrantyStatusChart.data.datasets[0].hoverBackgroundColor = warrantyColors;
+        warrantyStatusChart.update();
 
         /*
             Maintenance dashboard charts.
@@ -2793,7 +2809,7 @@
             'assignedMaintenancesByPlantLegend'
         );
 
-        createBarChart(
+        const maintenanceStatusChart = createBarChart(
             'maintenanceStatusChart',
             maintenanceStatusLabels,
             maintenanceStatusData,
@@ -2801,6 +2817,23 @@
             true,
             'logarithmic'
         );
+
+        const maintenanceStatusColors = {
+            'overdue': '#ef4444',    // Rojo
+            'pending': '#f97316',    // Naranja
+            'in review': '#eab308',  // Amarillo
+            'completed': '#22c55e'   // Verde
+        };
+
+        const statusColors = maintenanceStatusLabels.map((label) => {
+            const normalizedLabel = String(label).trim().toLowerCase();
+
+            return maintenanceStatusColors[normalizedLabel] ?? '#94a3b8';
+        });
+
+        maintenanceStatusChart.data.datasets[0].backgroundColor = statusColors;
+        maintenanceStatusChart.data.datasets[0].hoverBackgroundColor = statusColors;
+        maintenanceStatusChart.update();
 
         /*
             Asset Intelligence charts.

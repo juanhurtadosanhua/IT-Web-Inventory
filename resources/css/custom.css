@@ -305,8 +305,14 @@
 
 /* Sticky headers only for the inventory table */
 .inventory-table-responsive {
+    min-height: min(400px, 85vh);
     max-height: 85vh;
     overflow: auto;
+}
+
+/* Place the active filter cell above neighboring sticky headers */
+#inventoryTable thead tr:nth-child(2) th:has(.dropdown-menu.show) {
+    z-index: 10;
 }
 
 /* Avoid visual gaps behind sticky table headers */

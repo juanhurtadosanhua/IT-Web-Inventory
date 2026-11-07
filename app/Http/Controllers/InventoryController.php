@@ -31,7 +31,84 @@ class InventoryController extends Controller
             Admin, User and Read can view inventory.
         */
 
-        $inventoryQuery = Inventory::query() //consultar responsables
+        $inventoryQuery = $this->filteredInventoryQuery($request);
+
+        $plantOptions = Inventory::query()
+        ->whereNotNull('plant')
+        ->where('plant', '<>', '')
+        ->distinct()
+        ->orderBy('plant')
+        ->pluck('plant');
+
+            $maintenanceResponsibleOptions = User::query()
+            ->where('is_active', true) // Evitar asignar usuarios inactivos
+            ->whereIn('user_level', ['Admin', 'User']) // Excluir usuarios Read
+            ->orderBy('name')
+            ->get(['id', 'name', 'employee_number']);
+
+            $itRoomResponsibleOptions = User::query()
+                ->where('is_active', true)
+                ->whereHas('badges', function ($query) {
+                    $query
+                        ->where('badges.slug', 'it_room_responsible')
+                        ->where('user_badges.is_active', true);
+                })
+                ->with([
+                    'badges' => function ($query) {
+                        $query
+                            ->where('badges.slug', 'it_room_responsible')
+                            ->wherePivot('is_active', true);
+                    },
+                ])
+                ->get()
+                ->flatMap(function ($user) {
+                    return $user->badges
+                        ->filter(fn ($badge) => !empty($badge->pivot->plant))
+                        ->mapWithKeys(function ($badge) use ($user) {
+                            return [
+                                $badge->pivot->plant => [
+                                    'name' => $user->name,
+                                    'employee_number' => $user->employee_number,
+                                ],
+                            ];
+                        });
+                });
+
+        return view('inventory', [
+            'inventoryItems' => $inventoryQuery
+                ->paginate(100)
+                ->appends($request->query()),
+
+            'categoryOptions' => $this->categoryOptions(),
+            'categoryAcronymMap' => $this->categoryAcronyms(),
+            'plantCodeMap' => $this->plantCodes(),
+            'departmentAcronymMap' => $this->departmentAcronyms(),
+            'departmentOptions' => array_keys($this->departmentAcronyms()),
+            'nextSequentialByCategory' => $this->nextSequentialByCategory(),
+            'autoInternalNumberYear' => now()->year,
+            'existingInternalNumberRecords' => Inventory::query()
+                ->whereNotNull('it_internal_number')
+                ->where('it_internal_number', '<>', '')
+                ->get(['id', 'it_internal_number'])
+                ->map(fn ($item) => [
+                    'id' => (int) $item->id,
+                    'number' => (string) $item->it_internal_number,
+                ])
+                ->values(),
+            'classificationOptions' => $this->classificationOptions(),
+            'plantOptions' => $plantOptions,
+            'maintenanceResponsibleOptions' => $maintenanceResponsibleOptions,
+            'itRoomResponsibleOptions' => $itRoomResponsibleOptions,
+            'canManageMaintenance' => $this->canManageMaintenance(),
+            'canDeleteInventory' => $this->canDeleteInventory(),
+        ]);
+    }
+
+private function filteredInventoryQuery(Request $request)
+{
+    $user = Auth::user();
+
+    $inventoryQuery = Inventory::query() //consultar responsables
             ->with([
                 'creator',
                 'maintenanceResponsible',
@@ -239,79 +316,9 @@ class InventoryController extends Controller
         }
         /* End of creation date filter */
 
-        $plantOptions = Inventory::query()
-        ->whereNotNull('plant')
-        ->where('plant', '<>', '')
-        ->distinct()
-        ->orderBy('plant')
-        ->pluck('plant');
+    return $inventoryQuery;
+}
 
-            $maintenanceResponsibleOptions = User::query()
-            ->where('is_active', true) // Evitar asignar usuarios inactivos
-            ->whereIn('user_level', ['Admin', 'User']) // Excluir usuarios Read
-            ->orderBy('name')
-            ->get(['id', 'name', 'employee_number']);
-
-            $itRoomResponsibleOptions = User::query()
-                ->where('is_active', true)
-                ->whereHas('badges', function ($query) {
-                    $query
-                        ->where('badges.slug', 'it_room_responsible')
-                        ->where('user_badges.is_active', true);
-                })
-                ->with([
-                    'badges' => function ($query) {
-                        $query
-                            ->where('badges.slug', 'it_room_responsible')
-                            ->wherePivot('is_active', true);
-                    },
-                ])
-                ->get()
-                ->mapWithKeys(function ($user) {
-
-                    $badge = $user->badges->first();
-
-                    if (!$badge || !$badge->pivot->plant) {
-                        return [];
-                    }
-
-                    return [
-                        $badge->pivot->plant => [
-                            'name' => $user->name,
-                            'employee_number' => $user->employee_number,
-                        ],
-                    ];
-                });
-
-        return view('inventory', [
-            'inventoryItems' => $inventoryQuery
-                ->paginate(100)
-                ->appends($request->query()),
-
-            'categoryOptions' => $this->categoryOptions(),
-            'categoryAcronymMap' => $this->categoryAcronyms(),
-            'plantCodeMap' => $this->plantCodes(),
-            'departmentAcronymMap' => $this->departmentAcronyms(),
-            'departmentOptions' => array_keys($this->departmentAcronyms()),
-            'nextSequentialByCategory' => $this->nextSequentialByCategory(),
-            'autoInternalNumberYear' => now()->year,
-            'existingInternalNumberRecords' => Inventory::query()
-                ->whereNotNull('it_internal_number')
-                ->where('it_internal_number', '<>', '')
-                ->get(['id', 'it_internal_number'])
-                ->map(fn ($item) => [
-                    'id' => (int) $item->id,
-                    'number' => (string) $item->it_internal_number,
-                ])
-                ->values(),
-            'classificationOptions' => $this->classificationOptions(),
-            'plantOptions' => $plantOptions,
-            'maintenanceResponsibleOptions' => $maintenanceResponsibleOptions,
-            'itRoomResponsibleOptions' => $itRoomResponsibleOptions,
-            'canManageMaintenance' => $this->canManageMaintenance(),
-            'canDeleteInventory' => $this->canDeleteInventory(),
-        ]);
-    }
 private function applyItRoomResponsible(array $data): array
 {
     $location = strtoupper(trim($data['location'] ?? ''));
@@ -2016,6 +2023,35 @@ private function inventoryLogFields(): array
 
         return Excel::download(
             new SelectedInventoryExport($existingIds),
+            $fileName
+        );
+    }
+
+    /**
+     * Export all inventory assets matching the current filters.
+     */
+    public function exportFiltered(Request $request)
+    {
+        $inventoryIds = $this->filteredInventoryQuery($request)
+            ->pluck('id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        if (empty($inventoryIds)) {
+            return redirect()
+                ->route('inventory', $request->query())
+                ->with(
+                    'warning',
+                    'No assets match the current filters.'
+                );
+        }
+
+        $fileName = 'inventory_filtered_assets_'
+            . now()->format('Y-m-d_H-i-s')
+            . '.xlsx';
+
+        return Excel::download(
+            new SelectedInventoryExport($inventoryIds),
             $fileName
         );
     }

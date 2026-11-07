@@ -86,9 +86,14 @@ Route::middleware(['auth'])->group(function () {
     )->name('inventory.print-data');
     
     Route::post(
-    '/inventory/export-selected',
-    [InventoryController::class, 'exportSelected']
+        '/inventory/export-selected',
+        [InventoryController::class, 'exportSelected']
     )->name('inventory.export-selected');
+
+    Route::post(
+        '/inventory/export-filtered',
+        [InventoryController::class, 'exportFiltered']
+    )->name('inventory.export-filtered');
 
     /*
     |--------------------------------------------------------------------------

@@ -150,6 +150,23 @@
                 </button>
             </form>
 
+            <!-- Export all assets matching the current filters -->
+            <form
+                method="POST"
+                action="{{ route('inventory.export-filtered', request()->query()) }}"
+                class="d-inline"
+            >
+                @csrf
+
+                <button
+                    type="submit"
+                    class="btn btn-sm btn-outline-success"
+                    title="Export all assets matching the current filters"
+                >
+                    Export All Filtered
+                </button>
+            </form>
+
             @if (Auth::user()->user_level === 'Admin')
                 <!-- Show Upload Excel button only for admins -->
                 <button
