@@ -1465,7 +1465,7 @@
                                                         </div>
 
                                                         @php
-                                                            $validPlantOptions = ['B', 'D', 'G', 'H', 'MP', 'MPI', 'MPII'];
+                                                            $validPlantOptions = ['B', 'D', 'G', 'H', 'MP'];
                                                             $currentPlant = old('plant', $item->plant);
                                                             $isCurrentItRoom = strtoupper(trim(old('location', $item->location) ?? '')) === 'IT ROOM';
                                                         @endphp
@@ -2310,7 +2310,7 @@
                                         >
                                             <option value="">Select plant</option>
 
-                                            @foreach (['B', 'D', 'G', 'H', 'MP', 'MPI', 'MPII'] as $plant)
+                                            @foreach (['B', 'D', 'G', 'H', 'MP'] as $plant)
                                                 <option
                                                     value="{{ $plant }}"
                                                     {{ old('plant') === $plant ? 'selected' : '' }}
