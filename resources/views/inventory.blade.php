@@ -4320,6 +4320,23 @@ document.addEventListener('DOMContentLoaded', function () {
                             if (field) {
                                 if (field.tagName === 'SELECT') {
                                     field.disabled = true;
+
+                                    // Preserve disabled select values during form submission.
+                                    if (field.name && field.form) {
+                                        let hidden = Array.from(
+                                            field.form.querySelectorAll('input[type="hidden"]')
+                                        ).find(input => input.dataset.itRoomMirror === field.name);
+
+                                        if (!hidden) {
+                                            hidden = document.createElement('input');
+                                            hidden.type = 'hidden';
+                                            hidden.name = field.name;
+                                            hidden.dataset.itRoomMirror = field.name;
+                                            field.insertAdjacentElement('afterend', hidden);
+                                        }
+
+                                        hidden.value = field.value;
+                                    }
                                 } else {
                                     field.readOnly = true;
                                 }
@@ -4339,6 +4356,17 @@ document.addEventListener('DOMContentLoaded', function () {
                             if (field) {
                                 if (field.tagName === 'SELECT') {
                                     field.disabled = false;
+
+                                    // Remove the hidden mirror when the select becomes editable.
+                                    if (field.name && field.form) {
+                                        const hidden = Array.from(
+                                            field.form.querySelectorAll('input[type="hidden"]')
+                                        ).find(input => input.dataset.itRoomMirror === field.name);
+
+                                        if (hidden) {
+                                            hidden.remove();
+                                        }
+                                    }
                                 } else {
                                     field.readOnly = false;
                                 }
